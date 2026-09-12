@@ -202,25 +202,34 @@ def _job_runner(subject: str, force: bool):
                     f"flags: {kinds or 'none'}")
             except Exception as exc:                 # noqa: BLE001
                 job["log"].append(f"audit skipped: {exc}")
-            if os.environ.get("QBANK_AUTOPURGE", "1") == "1":
-                from qbank import purge as purge_mod
-                for d in sorted((config.OUTPUT_ROOT / "split").glob("*")):
-                    other = d.name
-                    if (other != subject and d.is_dir()
-                            and (config.OUTPUT_ROOT /
-                                 f"final_export_{other}.zip").exists()
-                            and _jobs.get(other, {}).get("status")
-                            != "running"):
-                        rm = purge_mod.purge_subject(config.OUTPUT_ROOT,
-                                                     other)
-                        job["log"].append(
-                            f"auto-purge {other}: freed "
-                            f"{len(rm)} volume item(s) (zip kept)")
             if not out["ok"]:
-                job["status"] = "error"
-                job["error"] = f"export REFUSED: {out['why']}"
+                if out.get("locked"):
+                    # normal workflow, NOT an error: review pending —
+                    # the zip builds itself on the last decision
+                    job["status"] = "done"
+                    job["log"].append(f"export gated: {out['why']}")
+                    job["log"].append("review ki last decision ke baad "
+                                      "zip auto-build hogi")
+                else:
+                    job["status"] = "error"
+                    job["error"] = f"export REFUSED: {out['why']}"
             else:
                 job["status"] = "done"
+                if os.environ.get("QBANK_AUTOPURGE", "1") == "1":
+                    from qbank import purge as purge_mod
+                    for d in sorted((config.OUTPUT_ROOT /
+                                     "split").glob("*")):
+                        other = d.name
+                        if (other != subject and d.is_dir()
+                                and (config.OUTPUT_ROOT /
+                                     f"final_export_{other}.zip").exists()
+                                and _jobs.get(other, {}).get("status")
+                                != "running"):
+                            rm = purge_mod.purge_subject(
+                                config.OUTPUT_ROOT, other)
+                            job["log"].append(
+                                f"auto-purge {other}: freed "
+                                f"{len(rm)} volume item(s) (zip kept)")
                 job["result"] = {
                     "chapters_run": res["chapters_run"],
                     "total_questions": res["total_questions"],
