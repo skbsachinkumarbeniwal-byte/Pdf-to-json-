@@ -349,3 +349,22 @@ def test_status_tolerates_half_written_zip(client):
     j = r.get_json()
     assert all(b["subject"] != "ZZZ" for b in j.get("books", []))
     bad.unlink()
+
+
+def test_zip_builds_after_last_decision_despite_frozen_run_flags(client,
+                                                                tmp_path):
+    """Run-time qa_status_counts.REVIEW_NEEDED never decreases; it must
+    not keep the zip locked once the human has decided every REVIEW
+    table (the user's exact production complaint)."""
+    import json as _json
+    ch = config.OUTPUT_ROOT / "split" / "TST" / "TST-001"
+    (ch / "chapter_completeness.json").write_text(_json.dumps({
+        "chapter_id": "TST-001", "census": {"ok": True},
+        "qa_status_counts": {"REVIEW_NEEDED": 3},
+        "unresolved_qid_count": 0}))
+    r = client.post("/api/decision", json={
+        "book": "TST", "q_id": "TST-001-001", "table_id": "T1",
+        "action": "approve"})
+    assert r.status_code == 200
+    z = config.OUTPUT_ROOT / "final_export_TST.zip"
+    assert z.exists(), "zip must build on the last review decision"

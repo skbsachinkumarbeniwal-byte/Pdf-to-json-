@@ -75,7 +75,6 @@ def gate_final_zip(output_root, subject: str) -> dict:
     book's run never re-locks an already-shipped one."""
     out_root = Path(output_root)
     problems = []
-    review_needed = 0
     chapters = 0
     for cf in _split_glob(out_root, subject, "chapter_completeness.json"):
         chapters += 1
@@ -83,14 +82,15 @@ def gate_final_zip(output_root, subject: str) -> dict:
         census = comp.get("census") or {}
         if not census.get("ok"):
             problems.append(f"{comp['chapter_id']}: census FAILED {census}")
-        review_needed += (comp.get("qa_status_counts") or {}).get(
-            "REVIEW_NEEDED", 0)
+        # NOTE: qa_status_counts.REVIEW_NEEDED is the run-time flag
+        # count — informational only.  It never decreases, so it must
+        # NOT hard-lock the zip; the human-review lock below
+        # (pending_count) is the one decisions can unlock.  The run's
+        # counts still ship in the receipt (shipped_qa_status_counts).
         if comp.get("unresolved_qid_count"):
             problems.append(
                 f"{comp['chapter_id']}: "
                 f"{comp['unresolved_qid_count']} unresolved q_id(s)")
-    if review_needed:
-        problems.append(f"{review_needed} row(s) flagged REVIEW_NEEDED")
     if chapters == 0:
         problems.append(f"no chapters on disk for {subject}")
     # human review layer (adopted): final zip hard-locked while any
