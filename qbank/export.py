@@ -19,6 +19,7 @@ chapters/rows are open.
 from __future__ import annotations
 
 import json
+import os
 import time
 import zipfile
 from pathlib import Path
@@ -160,7 +161,10 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
     }
 
     fm = Path(__file__).resolve().parent.parent / "FORMAT.md"
-    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+    # write to a .part name and rename at the end: /api/status may be
+    # globbing+reading zips while this runs — never expose a half zip
+    tmp = dest.with_name(dest.name + ".part")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("REVIEW_RECEIPT.json",
                    json.dumps(receipt, indent=2, ensure_ascii=False))
         if fm.exists():
@@ -176,5 +180,6 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
             p = aroot / rel
             if p.exists():
                 z.write(p, str(Path("assets") / "questions" / rel))
+    os.replace(tmp, dest)
     return {"ok": True, "path": str(dest), "receipt": receipt,
             "images_shipped": len(referenced)}

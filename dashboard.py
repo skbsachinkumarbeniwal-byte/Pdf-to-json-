@@ -202,6 +202,20 @@ def _job_runner(subject: str, force: bool):
                     f"flags: {kinds or 'none'}")
             except Exception as exc:                 # noqa: BLE001
                 job["log"].append(f"audit skipped: {exc}")
+            if os.environ.get("QBANK_AUTOPURGE", "1") == "1":
+                from qbank import purge as purge_mod
+                for d in sorted((config.OUTPUT_ROOT / "split").glob("*")):
+                    other = d.name
+                    if (other != subject and d.is_dir()
+                            and (config.OUTPUT_ROOT /
+                                 f"final_export_{other}.zip").exists()
+                            and _jobs.get(other, {}).get("status")
+                            != "running"):
+                        rm = purge_mod.purge_subject(config.OUTPUT_ROOT,
+                                                     other)
+                        job["log"].append(
+                            f"auto-purge {other}: freed "
+                            f"{len(rm)} volume item(s) (zip kept)")
             if not out["ok"]:
                 job["status"] = "error"
                 job["error"] = f"export REFUSED: {out['why']}"
@@ -275,11 +289,14 @@ def api_status():
     zips = {}
     for z in sorted(config.OUTPUT_ROOT.glob("final_export_*.zip")):
         key = z.stem[len("final_export_"):].strip("_").upper()
-        with zipfile.ZipFile(z) as zf:
-            try:
-                rc = json.loads(zf.read("REVIEW_RECEIPT.json"))
-            except Exception:                          # noqa: BLE001
-                rc = None
+        try:
+            with zipfile.ZipFile(z) as zf:
+                try:
+                    rc = json.loads(zf.read("REVIEW_RECEIPT.json"))
+                except Exception:                      # noqa: BLE001
+                    rc = None
+        except Exception:                              # noqa: BLE001
+            continue          # half-written/corrupt zip: skip, never 500
         zips[key] = {"bytes": z.stat().st_size, "name": z.name,
                      "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
                                             time.localtime(
@@ -381,6 +398,23 @@ def _maybe_export(book: str | None = None) -> dict | None:
     except Exception:                                # noqa: BLE001
         pass
     return None
+
+
+@app.post("/api/purge")
+def api_purge():
+    """Free the volume for ONE shipped subject: deletes its split /
+    assets / crops / review-ledger rows / resume state, keeps its zip
+    (keep_zip=false drops the zip too). Source PDF stays."""
+    b = request.get_json(silent=True) or {}
+    subj = (b.get("subject") or "").strip().upper()
+    if not subj:
+        return jsonify(ok=False, error="subject chahiye"), 400
+    if _jobs.get(subj, {}).get("status") == "running":
+        return jsonify(ok=False, error=f"{subj} is running"), 409
+    from qbank import purge as purge_mod
+    removed = purge_mod.purge_subject(config.OUTPUT_ROOT, subj,
+                                      keep_zip=bool(b.get("keep_zip", True)))
+    return jsonify(ok=True, subject=subj, removed=removed)
 
 
 @app.post("/api/export")
@@ -565,6 +599,15 @@ async function buildExport(s){
  if(!r.ok){alert("export refused: "+(r.error||"?"));return}
  refresh();
 }
+async function purgeBook(s){
+ if(!confirm(s+": extracted data (split/assets/crops/review rows) delete "+
+   "karein? final zip + PDF safe rahenge."))return;
+ const r=await fetch("/api/purge",{method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({subject:s})}).then(r=>r.json());
+ if(!r.ok){alert(r.error||"purge failed");return}
+ refresh();
+}
 async function fetchLink(){
  const url=$('link').value.trim();
  let subj=$('subject').value;
@@ -600,13 +643,17 @@ async function refresh(){
      ?`<button class="sec" title="build ${b.subject} zip"
         onclick="buildExport('${b.subject}')">zip</button>`
      :"");
+  const pg=b.zip
+   ?`<button class="sec" title="purge ${b.subject} extracted data — `+
+     `volume free karo, zip + PDF safe rahenge"
+      onclick="purgeBook('${b.subject}')">&#128465;</button>`:"";
   return `<tr><td><b>${b.subject}</b></td>
    <td>${b.file??"<i>missing</i>"}</td><td>${b.bytes?mb(b.bytes):"—"}</td>
    <td>${b.chapters_done}</td><td>${badge}</td>
    <td><button ${st.running?"disabled":""}
      onclick="run('${b.subject}',false)">Run</button>
     <button class="sec" ${st.running?"disabled":""}
-     onclick="run('${b.subject}',true)">Re-run</button> ${zb}</td></tr>`;
+     onclick="run('${b.subject}',true)">Re-run</button> ${zb} ${pg}</td></tr>`;
  }).join("")||'<tr><td colspan=6 class="hint">no books yet</td></tr>';
  const locked=st.books.filter(b=>b.gate_locked===true);
  const ready=st.books.filter(b=>b.gate_locked===false);

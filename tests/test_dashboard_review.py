@@ -307,3 +307,45 @@ def test_per_book_gate_and_independent_zip(client):
     # status exposes the independent zip
     st = client.get("/api/status").get_json()
     assert st["zips"]["AAA"]["name"] == "final_export_AAA.zip"
+
+
+def test_purge_frees_volume_keeps_zip(client):
+    from qbank import purge as purge_mod
+    root = config.OUTPUT_ROOT
+    _add_clean_subject(root)
+    # a shipped zip for AAA
+    import zipfile as zf
+    with zf.ZipFile(root / "final_export_AAA.zip", "w") as z:
+        z.writestr("REVIEW_RECEIPT.json", "{}")
+    # ledger rows for AAA (must be filtered) and TST (must stay)
+    from qbank import review as rv
+    rv.record_decision(root, "AAA", "AAA-001-001", "001-T01", "approve")
+    rv.record_decision(root, "TST", "TST-001-001", "001-T01", "approve")
+    led = root / rv.DECISIONS
+    assert "AAA" in led.read_text()
+    assert (root / "split" / "AAA").is_dir()
+    r = client.post("/api/purge", json={"subject": "AAA"})
+    assert r.status_code == 200, r.get_json()
+    assert not (root / "split" / "AAA").exists()
+    assert not (root / "assets" / "questions" / "AAA").exists()
+    assert (root / "final_export_AAA.zip").exists()   # zip kept
+    # TST (not purged) still intact
+    assert (root / "split" / "TST").is_dir()
+    assert "AAA" not in led.read_text()          # AAA rows gone
+    assert "TST" in led.read_text()              # TST rows kept
+    # no subject -> 400
+    assert client.post("/api/purge", json={}).status_code == 400
+    # direct module call with keep_zip=False drops the zip too
+    purge_mod.purge_subject(root, "AAA", keep_zip=False)
+    assert not (root / "final_export_AAA.zip").exists()
+
+
+def test_status_tolerates_half_written_zip(client):
+    # simulate the run-thread/status race: a garbage .zip on the volume
+    bad = config.OUTPUT_ROOT / "final_export_ZZZ.zip"
+    bad.write_bytes(b"PK\x03\x04 not a real zip")
+    r = client.get("/api/status")
+    assert r.status_code == 200, r.get_json()
+    j = r.get_json()
+    assert all(b["subject"] != "ZZZ" for b in j.get("books", []))
+    bad.unlink()

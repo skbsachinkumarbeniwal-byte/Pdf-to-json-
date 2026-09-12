@@ -191,6 +191,7 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
     dump_page_text(book, Path(output_root) / "data" / "page_text.jsonl")
     from .tables import build_vocab
     vocab = build_vocab(book)   # book-wide evidence for space repairs
+    book.drop_cache()           # vocab pass touched every page: free it
     llm_fn = verify_fn = None
     from . import llm as llm_mod
     if llm_mod.enabled():
@@ -232,6 +233,9 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
         if chapter_id not in prog["chapters_done"]:
             prog["chapters_done"].append(chapter_id)
         state_mod.save_state(state)
+        book.drop_cache()       # next chapter re-parses; RAM stays flat
+        import gc
+        gc.collect()
 
     write_chapters_json(config.DATA_DIR / "chapters.json", chapters_out)
     write_chapters_json(config.SUBJECTS_DIR / subject / "chapters.json",

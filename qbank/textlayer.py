@@ -164,6 +164,11 @@ def _tag_span_text(text: str, font: str) -> str:
 class Book:
     """Lazily-extracted structured view of one PDF."""
 
+    # pages are heavy (words + spans); a 1000+ page book would fill
+    # the container's RAM if every touched page stayed cached, so the
+    # cache is bounded (sequential access re-parses, which is cheap).
+    MAX_CACHED_PAGES = 32
+
     def __init__(self, path: str, page_offset: int = 0):
         self.doc = pymupdf.open(path)
         self.path = path
@@ -172,6 +177,10 @@ class Book:
 
     def __len__(self):
         return len(self.doc)
+
+    def drop_cache(self) -> None:
+        """Free all cached PageData (call between pipeline phases)."""
+        self._cache.clear()
 
     @property
     def total_pages(self):
@@ -272,6 +281,8 @@ class Book:
         pd.table_boxes = _ruled_table_boxes(p)
 
         self._cache[file_page] = pd
+        while len(self._cache) > self.MAX_CACHED_PAGES:
+            self._cache.pop(next(iter(self._cache)))
         return pd
 
     def set_offset(self, offset: int) -> None:
