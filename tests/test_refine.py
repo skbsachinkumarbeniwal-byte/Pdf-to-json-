@@ -28,6 +28,19 @@ def test_valid_rearrangement_shape():
     assert not refine_mod.valid_rearrangement("| A | B |")   # single row
 
 
+def test_rearrange_prompt_targets_book_artifacts():
+    """The prompt must keep teaching the exact artifact classes these
+    books print: mid-word line wraps ("mylo hyoid"), wrapped header
+    cells ("Pharyngeal A rch"), glued neighbour cells
+    ("cordisProximal") and missing punctuation spaces."""
+    from qbank import llm as llm_mod
+    p = llm_mod.REARRANGE_PROMPT
+    assert "mylohyoid" in p            # mid-word wrap inside a cell
+    assert "Pharyngeal Arch" in p      # wrapped header cell repair
+    assert "glued" in p.lower()        # un-glue neighbouring cells
+    assert "EXACTLY" in p              # content must not change
+
+
 def _stub(rows_by_md):
     calls = []
 

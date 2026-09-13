@@ -549,20 +549,37 @@ REARRANGE_PROMPT = """You are rearranging ONE medical-textbook table that
 was machine-extracted from a PDF page. The page image is attached as a
 layout reference (which cell printed where).
 
-The extraction is often badly arranged: values under the wrong header,
-the header row misplaced or missing its columns, glued fragments
-("ASCAOMP-C"), rows in a confusing order.
+The extraction is full of layout artifacts because the PDF prints each
+visual line separately and narrow columns force mid-word wraps:
+  * words broken across lines INSIDE a cell: "mylo hyoid" -> "mylohyoid",
+    "digast ric" -> "digastric", "tens or veli palatini" ->
+    "tensor veli palatini", "platys ma" -> "platysma",
+    "Mi ddle 1/3" -> "Middle 1/3", "ventr icle" -> "ventricle",
+    "developme nt" -> "development", "stag e" -> "stage";
+  * a header cell itself wrapped mid-word: "Pharyngeal A rch" ->
+    "Pharyngeal Arch", "Important events of each stag e" ->
+    "Important events of each stage";
+  * neighbouring rows/cells glued into one string:
+    "Bulbus cordisProximal 1/3Mi ddle 1/3 (conus cordis)Distal 1/3
+    (truncus arteriosus)" is really ONE label ("Bulbus cordis") with
+    THREE separate derivatives, each belonging in its own row/cell
+    exactly as the printed table shows;
+  * missing spaces around words and punctuation: "Rt.ventricle" ->
+    "Rt. ventricle", "period(First 2 weeks)" ->
+    "period (First 2 weeks)", "FertilizationCleavage and blastocyst
+    formation" -> "Fertilization; Cleavage and blastocyst formation".
 
 Using your MEDICAL KNOWLEDGE of what this table describes, return the
 SAME table rearranged so a medical student can read it:
-- put the header row first and give every column its proper heading;
-- move each value under the header it medically belongs to;
-- split glued fragments where the join is obvious from the image
-  (e.g. "ASCAOMP-C" -> "ASCA" | "OMP-C") and repair spacing;
-- order rows/sections the way the clinical concept dictates
-  (e.g. normal values before abnormal, cause before effect);
-- keep medical terminology, units, hyphens and capitalisation natural
-  and correct.
+- header row first, every column properly headed, no split words in it;
+- every value in the cell it medically belongs to; every word whole
+  (unwrapped, un-glued), natural single spaces, punctuation spaced;
+- where the printed table lists parallel entries inside one cell
+  (multiple derivatives, multiple events), give each its own row or a
+  clearly separated list — judge from the image;
+- keep every fact, value, unit, abbreviation, roman numeral and
+  citation EXACTLY as printed: change NOTHING about the content, only
+  its arrangement, wrapping and spacing.
 
 Return ONLY the rearranged pipe-markdown table (no fences, no prose),
 one row per line, every row with the same number of columns:
