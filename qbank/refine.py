@@ -80,8 +80,10 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
     if memo is not None and key in memo:
         new = memo[key]
     else:
-        pg = (t.get("source_pages") or [1])[0]
-        new = refine_fn(book, pg, md)
+        # ALL pages the table spans go to the model (cross-page
+        # merged tables need both page images to be rearranged whole)
+        pgs = [int(p) for p in (t.get("source_pages") or [1])] or [1]
+        new = refine_fn(book, pgs, md)
         if memo is not None:
             memo[key] = new
     if not new or new.strip() == md.strip():

@@ -124,6 +124,54 @@ def test_refine_flagged_mode_skips_clean_tables(tmp_path):
     assert calls == []
 
 
+def test_refine_table_passes_all_source_pages(tmp_path):
+    """Cross-page table: ALL spanned pages go to the model, not just
+    the first one."""
+    seen = []
+
+    def stub(book, pgs, md):
+        seen.append(list(pgs))
+        return REARRANGED
+    t = {"table_id": "T1", "markdown": GLUED,
+         "source_pages": [10, 11, 12],
+         "validation": {"table_qa": {"status": "REVIEW"}}}
+    assert refine_mod.refine_table(t, None, stub, "all") == "replaced"
+    assert seen == [[10, 11, 12]]
+
+
+def test_refiner_sends_one_image_per_page(tmp_path, monkeypatch):
+    """The Gemini payload carries one inline image per spanned page and
+    the multi-page instruction."""
+    import qbank.llm as llm_mod
+    import qbank.textlayer as tl
+    from test_mini_book import _build_book
+    pdf = tmp_path / "m.pdf"
+    _build_book(pdf)
+    book = tl.Book(str(pdf))
+    captured = {}
+
+    def fake_call(pool, key, model, payload):
+        captured["payload"] = payload
+        return REARRANGED
+    monkeypatch.setattr(llm_mod, "_call_text", fake_call)
+
+    rf = llm_mod.refiner(cache_dir=None, key="k")
+    out = rf(book, [2, 3], GLUED)                 # cross-page call
+    assert out == REARRANGED
+    parts = captured["payload"]["contents"][0]["parts"]
+    imgs = [p for p in parts if "inline_data" in p]
+    assert len(imgs) == 2                          # dono pages gaye
+    ask = parts[-1]["text"]
+    assert "2 page images are attached" in ask     # span note
+    assert "ONE continuous table" in ask
+    # single-page call: one image, no span note
+    rf(book, [2], GLUED)
+    parts = captured["payload"]["contents"][0]["parts"]
+    assert len([p for p in parts if "inline_data" in p]) == 1
+    assert "page images are attached" not in parts[-1]["text"]
+    book.close()
+
+
 def test_refine_off_switch(tmp_path, monkeypatch):
     """QBANK_REFINE=off: the chapter hook skips the pass entirely (the
     env default is 'all' — every extracted table goes to Gemini)."""

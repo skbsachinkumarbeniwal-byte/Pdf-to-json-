@@ -546,8 +546,9 @@ def verifier(cache_dir: Path | None = None, model: str | None = None,
 
 
 REARRANGE_PROMPT = """You are rearranging ONE medical-textbook table that
-was machine-extracted from a PDF page. The page image is attached as a
-layout reference (which cell printed where).
+was machine-extracted from PDF pages. One or more page images are
+attached as layout references, in reading order (a cross-page table
+arrives with ALL its pages).
 
 The extraction is full of layout artifacts because the PDF prints each
 visual line separately and narrow columns force mid-word wraps:
@@ -589,8 +590,9 @@ The PAGE IMAGE is the source of truth, not just a layout guide:
 - NEVER take content from your memory: what appears neither on the
   image nor in the extraction must not be invented — no fact, no
   word, no row from your own knowledge;
-- if the page itself is cut off (the table continues on another
-  page), keep exactly what is visible; complete nothing by guesswork.
+- if the table continues onto a page that is NOT among the attached
+  images, keep exactly what is visible on the attached ones;
+  complete nothing by guesswork.
 
 Return ONLY the rearranged pipe-markdown table (no fences, no prose),
 one row per line, every row with the same number of columns:
@@ -632,20 +634,26 @@ def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
 
 def refiner(cache_dir: Path | None = None, model: str | None = None,
             key: str | None = None, pool=None):
-    """Return refine(book, pg, current_md) -> markdown | None.
+    """Return refine(book, pgs, current_md) -> markdown | None.
 
-    Runs DURING extraction for every extracted table: Gemini rearranges
-    it per medical knowledge and the caller saves the returned markdown
-    (validated only for table structure, not content-identity)."""
+    Runs DURING extraction for every extracted table: Gemini sees ALL
+    pages the table spans (cross-page tables arrive whole), rearranges
+    it per medical knowledge and the caller saves the returned
+    markdown (validated only for table structure, not
+    content-identity)."""
     pool = pool or (None if key else keypool.get_pool())
     key = key or os.environ.get("GEMINI_API_KEY", "")
     model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
+    max_pages = int(os.environ.get("QBANK_REFINE_MAX_PAGES", "4"))
 
-    def refine(book, pg: int, current_md: str) -> str | None:
+    def refine(book, pgs, current_md: str) -> str | None:
+        pgs = [int(p) for p in (pgs if isinstance(pgs, (list, tuple))
+                                else [pgs])] or [1]
+        pgs = pgs[:max_pages]
         cache = None
         if cache_dir is not None:
             sig = hashlib.sha1(
-                f"R4|{getattr(book.doc, 'name', '')}|{pg}|"
+                f"R5|{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
                 f"{hashlib.sha1(current_md.encode()).hexdigest()}"
                 .encode()).hexdigest()
             cache = cache_dir / f"{sig}.json"
@@ -655,13 +663,24 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
                 except Exception:
                     pass
         try:
-            pix = book.doc[pg - 1].get_pixmap(matrix=pymupdf.Matrix(2, 2))
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
+            parts = []
+            for pg in pgs:
+                pix = book.doc[pg - 1].get_pixmap(
+                    matrix=pymupdf.Matrix(2, 2))
+                parts.append({"inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(
+                        pix.tobytes("png")).decode()}})
+            ask = REARRANGE_PROMPT
+            if len(pgs) > 1:
+                ask += (f"\n\n{len(pgs)} page images are attached, in "
+                        "reading order. This table spans them: treat "
+                        "the pages as ONE continuous table and "
+                        "rearrange across the whole span — the page "
+                        "break is itself an artifact to repair.")
+            parts.append({"text": ask + "\n\nExtraction:\n" + current_md})
             payload = {
-                "contents": [{"parts": [
-                    {"inline_data": {"mime_type": "image/png", "data": b64}},
-                    {"text": REARRANGE_PROMPT + "\n\nExtraction:\n" +
-                     current_md}]}],
+                "contents": [{"parts": parts}],
                 "generationConfig": {"temperature": 0.0,
                                      "max_output_tokens": 8192},
             }
