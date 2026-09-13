@@ -267,3 +267,60 @@ def test_refine_runs_during_extraction(tmp_path, monkeypatch):
     assert refine_mod.refined_count(out, "TST") == 1
     assert "| Kinase | adds phosphate | cytosol |" in \
         qt["validation"]["pre_gemini_markdown"]
+
+
+def test_run_log_shows_refine_stats(tmp_path, monkeypatch, capsys):
+    """Per-chapter refine stats are LOUD in the run log — kuch bhi
+    silently na ho (rearranged/unchanged/no-answer/invalid counts)."""
+    from qbank import run
+    from test_mini_book import _build_book
+    out = tmp_path / "out"
+    monkeypatch.setattr(config, "OUTPUT_ROOT", out)
+    monkeypatch.setattr(config, "DATA_DIR", out / "data")
+    monkeypatch.setattr(config, "ASSETS_DIR", out / "assets" / "questions")
+    monkeypatch.setattr(config, "SPLIT_DIR", out / "split")
+    monkeypatch.setattr(config, "SUBJECTS_DIR", out / "subjects")
+    monkeypatch.setattr(config, "STATE_FILE", out / "state.json")
+    pdf = tmp_path / "mini.pdf"
+    _build_book(pdf)
+    from qbank import llm as llm_mod
+    monkeypatch.setattr(llm_mod, "enabled", lambda: True)
+    monkeypatch.setattr(llm_mod, "transcriber",
+                        lambda cache_dir=None, **k:
+                        lambda book, pg, box: None)
+    monkeypatch.setattr(llm_mod, "verifier",
+                        lambda cache_dir=None, **k:
+                        lambda book, pg, box, s: None)
+    monkeypatch.setattr(llm_mod, "refiner",
+                        lambda cache_dir=None, **k:
+                        lambda book, pgs, md: md)
+    run.run_book(str(pdf), "TST", page_offset="auto", force=True,
+                 output_root=out)
+    log = capsys.readouterr().out
+    assert "Gemini refine" in log and "rearranged" in log
+    # model returned the extraction as-is -> 'unchanged' bucket
+    assert "1 unchanged" in log or "2 unchanged" in log
+
+
+def test_run_log_warns_when_gemini_disabled(tmp_path, monkeypatch, capsys):
+    """No key -> LOUD warning in the run log (the exact silent failure
+    the user hit on Railway)."""
+    from qbank import run
+    from test_mini_book import _build_book
+    out = tmp_path / "out"
+    monkeypatch.setattr(config, "OUTPUT_ROOT", out)
+    monkeypatch.setattr(config, "DATA_DIR", out / "data")
+    monkeypatch.setattr(config, "ASSETS_DIR", out / "assets" / "questions")
+    monkeypatch.setattr(config, "SPLIT_DIR", out / "split")
+    monkeypatch.setattr(config, "SUBJECTS_DIR", out / "subjects")
+    monkeypatch.setattr(config, "STATE_FILE", out / "state.json")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
+    from qbank import keypool
+    monkeypatch.setattr(keypool, "discover_keys", lambda env=None: [])
+    pdf = tmp_path / "mini.pdf"
+    _build_book(pdf)
+    run.run_book(str(pdf), "TST", page_offset="auto", force=True,
+                 output_root=out)
+    log = capsys.readouterr().out
+    assert "Gemini DISABLED" in log and "no GEMINI_API_KEY" in log

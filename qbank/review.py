@@ -80,6 +80,7 @@ def review_tables(out_root: Path) -> list:
                     "markdown": t["markdown"],
                     "pages": t["source_pages"],
                     "cross_page": bool(t.get("merged_continuation")),
+                    "refined": bool(v.get("refined_by_gemini")),
                     "state": state,
                 })
     return items

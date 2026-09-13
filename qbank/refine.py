@@ -70,7 +70,7 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
                  ledger_path: Path | None = None) -> str:
     """Rearrange one table record in place with Gemini's medical
     rearrangement and SAVE the model's output. Returns
-    "replaced" | "skip" | "invalid"."""
+    "replaced" | "same" | "empty" | "invalid" | "skip"."""
     if only != "all" and not flagged(t):
         return "skip"
     md = t.get("markdown") or ""
@@ -86,8 +86,10 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
         new = refine_fn(book, pgs, md)
         if memo is not None:
             memo[key] = new
-    if not new or new.strip() == md.strip():
-        return "skip"
+    if not new:
+        return "empty"         # model returned nothing usable
+    if new.strip() == md.strip():
+        return "same"          # model returned the extraction as-is
     if not valid_rearrangement(new):
         return "invalid"       # not a table: keep the deterministic one
     val = t.setdefault("validation", {})

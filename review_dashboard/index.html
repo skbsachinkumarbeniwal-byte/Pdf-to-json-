@@ -115,7 +115,7 @@ function renderList(){
       html += `<div class="item" data-i="${i}" onclick="select(${i})">
         <span class="st ${st}">${st}</span>
         <div class="t">${it.table_id} <span style="color:var(--mut);font-weight:400">${it.q_id}</span></div>
-        <div class="s">${it.suspects.map(s=>`<span class="chip">${esc(s)}</span>`).join("")||"no suspects"}${it.cross_page?" · cross-page":""}</div></div>`;
+        <div class="s">${it.refined?'<span class="chip" style="background:#123524;color:var(--ok)">gemini refined</span>':""}${it.suspects.map(s=>`<span class="chip">${esc(s)}</span>`).join("")||"no suspects"}${it.cross_page?" · cross-page":""}</div></div>`;
     }
   }
   if (AUDIT.length){
@@ -275,7 +275,7 @@ function select(i){
       <span style="color:var(--mut)">(${it.q_id})</span>
       <span class="st ${it.state.startsWith("decided")?"decided":it.state.startsWith("stale")?"stale":"pending"}">${it.state}</span></h2>
     <div class="meta">suspects: <b>${it.suspects.map(esc).join(", ")||"none"}</b>
-      · pages ${it.pages.join(", ")}${it.cross_page?" · merged cross-page":""}</div>
+      · pages ${it.pages.join(", ")}${it.cross_page?" · merged cross-page":""}${it.refined?" · <b style='color:var(--ok)'>gemini refined</b>":" · NOT gemini-refined"}</div>
     <button class="btn ok" onclick="decide('approve')">Approve as-is</button>
     <button class="btn" onclick="editMode()">Edit table</button>
     <button class="btn bad" onclick="decide('reject')">Reopen</button>
