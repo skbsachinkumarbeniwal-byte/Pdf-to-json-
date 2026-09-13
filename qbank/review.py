@@ -166,6 +166,62 @@ def edit_count(out_root: Path) -> int:
     return len(_read_jsonl(Path(out_root) / EDIT_LEDGER))
 
 
+def delete_table(out_root: Path, book: str, q_id: str,
+                 table_id: str) -> dict:
+    """Remove ONE table (q_id + table_id) from EVERY copy (questions +
+    solutions) — for junk/garbage tables that must not ship at all.
+    Read-back verified; the deleted markdown is preserved in the edit
+    ledger (kind=table_delete) so nothing is silently lost. A deleted
+    REVIEW table leaves the queue, so deleting the last pending one
+    opens the gate (the caller rebuilds the zip)."""
+    want_q = (q_id or "").strip().upper()
+    touched = 0
+    deleted_md = None
+    for nf in ("questions.jsonl", "solutions.jsonl"):
+        for qf in sorted((Path(out_root) / "split" / book
+                          ).glob(f"*/{nf}")):
+            lines = qf.read_text().splitlines()
+            changed = False
+            for i, l in enumerate(lines):
+                if not l.strip():
+                    continue
+                r = json.loads(l)
+                if (r.get("q_id") or "").upper() != want_q:
+                    continue
+                tables = r.get("tables") or []
+                keep = []
+                for t in tables:
+                    if t.get("table_id") == table_id:
+                        touched += 1
+                        deleted_md = deleted_md or t.get("markdown") or ""
+                        continue
+                    keep.append(t)
+                if len(keep) != len(tables):
+                    r["tables"] = keep
+                    lines[i] = json.dumps(r, ensure_ascii=False)
+                    changed = True
+            if changed:
+                qf.write_text("\n".join(lines) + "\n")
+    if touched == 0:
+        return {"ok": False, "why": "table not found"}
+    # read-back verification — gone from EVERY copy?
+    for nf in ("questions.jsonl", "solutions.jsonl"):
+        for qf in sorted((Path(out_root) / "split" / book
+                          ).glob(f"*/{nf}")):
+            for r in _read_jsonl(qf):
+                if (r.get("q_id") or "").upper() != want_q:
+                    continue
+                for t in r.get("tables") or []:
+                    if t.get("table_id") == table_id:
+                        return {"ok": False, "why": "read-back mismatch"}
+    _append_jsonl(Path(out_root) / EDIT_LEDGER,
+                  {"key": decision_key(book, q_id, table_id),
+                   "kind": "table_delete",
+                   "markdown": deleted_md,
+                   "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S")})
+    return {"ok": True, "copies": touched}
+
+
 def pending_count(out_root: Path, subject: str | None = None) -> int:
     """REVIEW tables whose decision is missing or stale. subject=CODE
     scopes the count to one book so per-book gates stay independent."""

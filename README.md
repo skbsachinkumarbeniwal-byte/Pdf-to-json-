@@ -4,12 +4,15 @@ Extracts question banks from MARROW ED8 PDFs **with a corrected text
 layer** into the v1 `final_export.zip` contract (`FORMAT.md`).
 
 v2 replaces the old OCR/Gemini/review-layer pipeline. The text layer of
-the corrected books is authoritative, so extraction is now **fully
-deterministic — zero LLM calls, zero network, pure CLI**. Nothing is
-ever guessed: a row is written only when the printed page proves it,
-and the census gate (per book, or across all books for the combined zip)
-refuses to build an export zip when any chapter's
-question headers, answer-key rows and solution headers do not match.
+the corrected books is authoritative, so extraction is deterministic in
+its matrix: nothing is ever guessed — a row is written only when the
+printed page proves it. Gemini is used inside extraction for tables
+only: every extracted table is sent to the model once, which rearranges
+it per medical knowledge, and that rearranged markdown is what ships
+(provenance kept on the record). The export gate is the human-review
+layer: the zip builds the moment the book's REVIEW tables are all
+decided; census anomalies and unresolved q_ids ride along in the
+receipt as advisories instead of blocking the build.
 
 ## Prerequisites
 
@@ -171,17 +174,22 @@ dashboard binds it and Railway exposes the public URL automatically.
    render of their union bbox (pixel-exact stitch, seams and vector
    overlays included) instead of cut fragments — recorded in
    `chapter_completeness.json` as `merged_placements`.
-7. **Optional Gemini table-text pass** (`qbank/llm.py`) — with
-   `GEMINI_API_KEY` set, each ruled box is also rendered and sent to
-   Gemini (default model `gemini-3.5-flash-lite`, override with
-   `QBANK_LLM_MODEL`) asking only for cell transcription. A model cell
-   is accepted ONLY when it is character-identical to the
-   deterministic cell after whitespace removal — the model may
-   re-space, never re-word; shape mismatches, API errors or a missing
-   key fall back to the deterministic matrix. Responses cached under
+7. **Optional Gemini table passes** (`qbank/llm.py`) — with
+   `GEMINI_API_KEY` set: (a) each ruled box is rendered and sent for
+   cell transcription (default model `gemini-3.5-flash-lite`, override
+   with `QBANK_LLM_MODEL`); a model cell is accepted ONLY when it is
+   character-identical to the deterministic cell after whitespace
+   removal; (b) during extraction EVERY extracted table is sent once
+   more for rearrangement — TEXT-ONLY, the extracted pipe-markdown
+   itself (no page images) — the model returns the table rearranged per
+   medical knowledge (headers, cell placement, row order) and that
+   markdown is what ships, with the original preserved under
+   `validation.pre_gemini_markdown` (`QBANK_REFINE=flagged` narrows it
+   to flagged tables, `=off` disables). Responses cached under
    `<output>/llm_cache/`. Without a key the pipeline stays zero-LLM.
-8. **Gate** (`qbank/export.py`) — the zip is built only when every
-   chapter's census is contiguous and no row is `REVIEW_NEEDED`.
+8. **Gate** (`qbank/export.py`) — the zip builds as soon as every
+   chapter is on disk and the book's REVIEW tables are all decided;
+   census failures / unresolved q_ids ship as receipt advisories.
 
 **Provenance.** Every text field ships as `TEXT_LAYER` because v2 reads
 only the PDF's internal text layer. That makes it immune to OCR
@@ -219,15 +227,19 @@ inventing content.
 
 ## Troubleshooting gate failures
 
-`python -m qbank export` refuses the zip (and prints the blocking
-items) when any of these hold — do not bypass the gate, fix the cause:
+The export gate now blocks only on the human-review layer: the zip is
+refused while REVIEW tables are undecided or stale (the review
+dashboard clears it). These are NOT blockers any more, but always
+investigate them — they mean data you may be missing:
 
-- **census failed** — question headers, key rows or solution headers
-  are non-contiguous or unequal in a chapter. Usually a header variant
-  the zone regexes missed, or a genuinely misprinted book.
-- **unresolved q_ids** — printed key/solution anchors exist with no
-  matching question header (see `unresolved_qids.jsonl`, which records
-  the exact reason from a fixed vocabulary).
+- **census failed** (advisory, in the receipt) — question headers, key
+  rows or solution headers are non-contiguous or unequal in a chapter.
+  Usually a header variant the zone regexes missed, or a genuinely
+  misprinted book.
+- **unresolved q_ids** (advisory, in the receipt) — printed
+  key/solution anchors exist with no matching question header (see
+  `unresolved_qids.jsonl`, which records the exact reason from a fixed
+  vocabulary).
 - **`REVIEW_NEEDED` rows** — a glyph sentinel no rule could resolve.
   See step 4 of the onboarding guide.
 
@@ -297,9 +309,10 @@ PDF, run extraction, watch the log, download the review-gated per-book `final_ex
 (one book, one gate, one zip). Two more surfaces hang off it:
 
 - `/review` — the human review dashboard: every REVIEW-flagged table,
-  printed-page crop beside the extracted JSON, in-place edit + approve.
-  Decisions persist in append-only ledgers and hold the export gate
-  until the queue is resolved.
+  printed-page crop beside the extracted JSON, in-place edit + approve
+  + delete (junk tables vanish from every copy; the ledger keeps a
+  backup). Decisions persist in append-only ledgers and hold the
+  export gate until the queue is resolved.
 - `/api/audit` — the post-run content audit report (numeric drift,
   duplicates, thin options, bad answer key); advisory flags only.
 

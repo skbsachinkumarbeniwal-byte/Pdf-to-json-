@@ -545,21 +545,55 @@ def verifier(cache_dir: Path | None = None, model: str | None = None,
     return verify
 
 
-REFINE_PROMPT = """You are rearranging a badly-arranged extraction of ONE
-medical-textbook table. A page image is attached ONLY as a layout
-reference (which cell belongs to which column/row).
+REARRANGE_PROMPT = """You are rearranging ONE medical-textbook table that
+a deterministic pipeline extracted from a PDF's text layer. You receive
+ONLY the extracted pipe-markdown below — no page image.
 
-Return ONLY the rearranged pipe-markdown table (no fences, no prose).
-HARD RULES — "only same content of table":
-- Use ONLY the words/numbers already present in the extraction given
-  below. Add NOTHING: no new values, percentages, headers, rows,
-  columns, no medical knowledge, no synonyms.
-- Delete NOTHING: every word of the extraction must appear.
-- You MAY split glued fragments where the join is obvious from the
-  image (e.g. "ASCAOMP-C" -> "ASCA" | "OMP-C") and re-assign cells to
-  their proper columns/rows so the table reads like the printed one.
-- Keep medical terms, hyphens, units and capitalisation exactly as
-  printed in the extraction."""
+The extraction is full of layout artifacts because narrow columns and
+line breaks print each visual line separately:
+  * words broken across lines INSIDE a cell: "mylo hyoid" -> "mylohyoid",
+    "digast ric" -> "digastric", "tens or veli palatini" ->
+    "tensor veli palatini", "platys ma" -> "platysma",
+    "Mi ddle 1/3" -> "Middle 1/3", "ventr icle" -> "ventricle",
+    "developme nt" -> "development", "stag e" -> "stage";
+  * a header cell itself wrapped mid-word: "Pharyngeal A rch" ->
+    "Pharyngeal Arch", "Important events of each stag e" ->
+    "Important events of each stage";
+  * neighbouring rows/cells glued into one string:
+    "Bulbus cordisProximal 1/3Mi ddle 1/3 (conus cordis)Distal 1/3
+    (truncus arteriosus)" is really ONE label ("Bulbus cordis") with
+    THREE separate derivatives, each belonging in its own row/cell
+    exactly as the printed table shows;
+  * missing spaces around words and punctuation: "Rt.ventricle" ->
+    "Rt. ventricle", "period(First 2 weeks)" ->
+    "period (First 2 weeks)", "FertilizationCleavage and blastocyst
+    formation" -> "Fertilization; Cleavage and blastocyst formation".
+
+Using your MEDICAL KNOWLEDGE of what this table describes, return the
+SAME table rearranged so a medical student can read it:
+- header row first, every column properly headed, no split words in it;
+- every value in the cell it medically belongs to; every word whole
+  (unwrapped, un-glued), natural single spaces, punctuation spaced;
+- where the extraction lists parallel entries inside one cell
+  (multiple derivatives, multiple events), give each its own row or a
+  clearly separated list;
+- keep every fact, value, unit, abbreviation, roman numeral and
+  citation EXACTLY as in the extraction: arrangement, wrapping and
+  spacing may change, content may not.
+
+The extraction is the ONLY source:
+- add NOTHING from your memory — no fact, no word, no row, no value
+  that is not already present in it;
+- completing an obvious mid-word split ("digast ric" -> "digastric")
+  is repair, not addition;
+- if a cell looks cut off (its continuation is simply not in the
+  extraction), keep exactly what is given; no guesswork.
+
+Return ONLY the rearranged pipe-markdown table (no fences, no prose),
+one row per line, every row with the same number of columns:
+| Header | Header |
+|---|---|
+| ... | ... |"""
 
 
 def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
@@ -595,19 +629,24 @@ def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
 
 def refiner(cache_dir: Path | None = None, model: str | None = None,
             key: str | None = None, pool=None):
-    """Return refine(book, pg, current_md) -> markdown | None.
+    """Return refine(book, pgs, current_md) -> markdown | None.
 
-    Rearranges one flagged table with Gemini vision; the caller MUST
-    enforce the same-content envelope before accepting the result."""
+    Runs DURING extraction for every extracted table. TEXT-ONLY: the
+    extracted pipe-markdown itself is what Gemini refines — no page
+    images are rendered or sent. The caller saves the returned
+    markdown (validated only for table structure, not
+    content-identity)."""
     pool = pool or (None if key else keypool.get_pool())
     key = key or os.environ.get("GEMINI_API_KEY", "")
     model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
 
-    def refine(book, pg: int, current_md: str) -> str | None:
+    def refine(book, pgs, current_md: str) -> str | None:
+        pgs = [int(p) for p in (pgs if isinstance(pgs, (list, tuple))
+                                else [pgs])] or [1]
         cache = None
         if cache_dir is not None:
             sig = hashlib.sha1(
-                f"R3|{getattr(book.doc, 'name', '')}|{pg}|"
+                f"R6|{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
                 f"{hashlib.sha1(current_md.encode()).hexdigest()}"
                 .encode()).hexdigest()
             cache = cache_dir / f"{sig}.json"
@@ -616,17 +655,19 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
                     return json.loads(cache.read_text())
                 except Exception:
                     pass
+        ask = REARRANGE_PROMPT
+        if len(pgs) > 1:
+            ask += (f"\n\nThe extraction below covers a table that "
+                    f"spanned {len(pgs)} printed pages: treat it as "
+                    "ONE continuous table — the page break is just "
+                    "another artifact to repair.")
+        payload = {
+            "contents": [{"parts": [
+                {"text": ask + "\n\nExtraction:\n" + current_md}]}],
+            "generationConfig": {"temperature": 0.0,
+                                 "max_output_tokens": 8192},
+        }
         try:
-            pix = book.doc[pg - 1].get_pixmap(matrix=pymupdf.Matrix(2, 2))
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
-            payload = {
-                "contents": [{"parts": [
-                    {"inline_data": {"mime_type": "image/png", "data": b64}},
-                    {"text": REFINE_PROMPT + "\n\nExtraction:\n" +
-                     current_md}]}],
-                "generationConfig": {"temperature": 0.0,
-                                     "max_output_tokens": 8192},
-            }
             txt = _call_text(pool, key, model, payload)
         except Exception:
             txt = None

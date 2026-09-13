@@ -1,17 +1,29 @@
-"""Gemini table refinement: rearranges badly-arranged extracted tables
-into clean pipe-markdown — "only same content of table".
+"""Gemini table rearrangement — runs DURING extraction, not after.
 
-The model sees the page image (layout reference) plus the current
-extraction and may rearrange / split glued fragments, but the result
-is accepted ONLY if it passes the same-content envelope (identical
-alphanumeric character stream: nothing added, nothing deleted).  A
-refined table stays in the human REVIEW queue — the user's approval
-is still the gate before the final zip."""
+Every table the deterministic pipeline extracts (question or solution,
+flagged or clean) is sent to Gemini once as TEXT — the current
+pipe-markdown extraction itself, no page images — with the ask
+"rearrange this table properly, per medical knowledge". The model's
+markdown is what gets SAVED on the table record:
+
+  * accepted when it parses as an even pipe-markdown table (>=2 rows,
+    >=2 columns, every row the same width) — otherwise the
+    deterministic extraction is kept as-is;
+  * the original deterministic markdown is preserved under
+    validation.pre_gemini_markdown and the table is marked
+    table_qa.refined_by_gemini for provenance;
+  * every accepted rearrangement is logged to data/refine_ledger.jsonl
+    (the receipt's tables_refined count reads it).
+
+No manual trigger: with GEMINI_API_KEY set the pass runs inside
+run_chapter; without a key nothing is called and the deterministic
+tables ship unchanged. REVIEW flags are untouched — flagged tables
+still queue for the human, and the human queue still gates the zip.
+"""
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -21,14 +33,31 @@ from . import config
 LEDGER = "refine_ledger.jsonl"
 
 
-def norm_concat(md: str | None) -> str:
-    return re.sub(r"[^0-9a-z]+", "", (md or "").lower())
+def md_table_shape(md: str) -> int | None:
+    """Column count of an even pipe-markdown table (separator row
+    excluded), else None. Needs >=2 rows and >=2 columns."""
+    lines = [l for l in (md or "").strip().splitlines() if l.strip()]
+    if len(lines) >= 2 and re.fullmatch(r"[\s|:-]+", lines[1] or " "):
+        lines.pop(1)
+    if len(lines) < 2:
+        return None
+    widths = set()
+    for l in lines:
+        cells = [c for c in l.strip().strip("|").split("|")]
+        if len(cells) < 2 or any(not c.strip() for c in cells):
+            return None
+        widths.add(len(cells))
+    return widths.pop() if len(widths) == 1 else None
 
 
-def same_content(old: str, new: str | None) -> bool:
-    """Nothing added, nothing deleted — splits of glued fragments keep
-    the alphanumeric stream identical; any invented word breaks it."""
-    return bool(new) and norm_concat(old) == norm_concat(new)
+def valid_rearrangement(new_md: str | None) -> bool:
+    """A model answer is saved only when it IS a table — even, wide
+    enough, no prose/fences riding along."""
+    if not new_md or not new_md.strip():
+        return False
+    if "```" in new_md:
+        return False
+    return md_table_shape(new_md) is not None
 
 
 def flagged(t: dict) -> bool:
@@ -36,10 +65,12 @@ def flagged(t: dict) -> bool:
             .get("status") == "REVIEW")
 
 
-def refine_table(t: dict, book, refine_fn, only: str,
-                 memo: dict | None = None) -> str:
-    """Refine one table record in place.
-    Returns "replaced" | "rejected" | "skip"."""
+def refine_table(t: dict, book, refine_fn, only: str = "all",
+                 memo: dict | None = None, ledger_key: str | None = None,
+                 ledger_path: Path | None = None) -> str:
+    """Rearrange one table record in place with Gemini's medical
+    rearrangement and SAVE the model's output. Returns
+    "replaced" | "skip" | "invalid"."""
     if only != "all" and not flagged(t):
         return "skip"
     md = t.get("markdown") or ""
@@ -49,23 +80,29 @@ def refine_table(t: dict, book, refine_fn, only: str,
     if memo is not None and key in memo:
         new = memo[key]
     else:
-        pg = (t.get("source_pages") or [1])[0]
-        new = refine_fn(book, pg, md)
+        # the pages the table spans are passed for context only
+        # (cache key + multi-page span note) — no images are sent
+        pgs = [int(p) for p in (t.get("source_pages") or [1])] or [1]
+        new = refine_fn(book, pgs, md)
         if memo is not None:
             memo[key] = new
     if not new or new.strip() == md.strip():
         return "skip"
-    if not same_content(md, new):
-        return "rejected"      # invented/removed content: keep original
-    t["markdown"] = new
-    qa = (t.setdefault("validation", {})
-          .setdefault("table_qa", {}))
+    if not valid_rearrangement(new):
+        return "invalid"       # not a table: keep the deterministic one
+    val = t.setdefault("validation", {})
+    val.setdefault("pre_gemini_markdown", md)
+    qa = val.setdefault("table_qa", {})
     qa["refined_by_gemini"] = True
+    t["markdown"] = new.strip()
+    if ledger_key and ledger_path is not None:
+        _append(ledger_path, {"key": ledger_key, "ts":
+                              time.strftime("%Y-%m-%dT%H:%M:%S")})
     return "replaced"
 
 
 def refined_count(output_root, subject: str) -> int:
-    """Distinct tables whose refinement was accepted (receipt)."""
+    """Distinct tables Gemini rearranged during extraction (receipt)."""
     p = Path(output_root) / "data" / LEDGER
     if not p.exists():
         return 0
@@ -86,56 +123,3 @@ def _append(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
-
-
-def refine_subject(output_root, subject: str, refine_fn=None,
-                   only: str | None = None, log=print) -> dict:
-    """Retro-pass over an already-extracted book: rewrite flagged (or
-    all, only="all") table markdowns in questions/solutions jsonl.
-    Decisions fingerprinted to the old markdown become stale, so the
-    refined tables return to the review queue for the user."""
-    out = Path(output_root)
-    only = only or os.environ.get("QBANK_REFINE", "flagged")
-    split = out / "split" / subject
-    if not split.is_dir():
-        return {"refined": 0, "rejected": 0,
-                "why": f"no extracted data for {subject}"}
-    if refine_fn is None:
-        from . import llm as llm_mod
-        if not llm_mod.enabled():
-            return {"refined": 0, "rejected": 0, "why": "gemini disabled"}
-        refine_fn = llm_mod.refiner(out / "llm_cache")
-    from .textlayer import Book
-    entry = config.load_books().get(subject)
-    book = Book(str(config.resolve_book_path(entry)))
-
-    refined = rejected = 0
-    memo: dict = {}
-    ledger = out / "data" / LEDGER
-    for nf in ("questions.jsonl", "solutions.jsonl"):
-        for qf in sorted(split.glob(f"*/{nf}")):
-            rows = [json.loads(l) for l in qf.read_text().splitlines()
-                    if l.strip()]
-            changed = False
-            for row in rows:
-                for t in row.get("tables") or []:
-                    st = refine_table(t, book, refine_fn, only, memo)
-                    if st == "replaced":
-                        if nf == "questions.jsonl":
-                            refined += 1
-                        changed = True
-                        _append(ledger, {
-                            "key": f"{subject}|{row.get('q_id')}|"
-                                   f"{t.get('table_id')}",
-                            "file": nf, "ts": time.strftime(
-                                "%Y-%m-%dT%H:%M:%S"),
-                            "envelope": "same-content"})
-                    elif st == "rejected" and nf == "questions.jsonl":
-                        rejected += 1
-            if changed:
-                qf.write_text("".join(
-                    json.dumps(r, sort_keys=True) + "\n" for r in rows))
-    book.close()
-    log(f"[{subject}] refine: {refined} table(s) rearranged "
-        f"(same-content envelope), {rejected} model answer(s) rejected")
-    return {"refined": refined, "rejected": rejected}
