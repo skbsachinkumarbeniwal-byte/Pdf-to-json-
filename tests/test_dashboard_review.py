@@ -99,6 +99,49 @@ def test_edit_missing_fields_400(client):
     r = client.post("/api/edit", json={"book": "TST"})
     assert r.status_code == 400
 
+def test_delete_table_removes_every_copy_and_builds_zip(client):
+    """Delete removes the table from BOTH copies, ledger keeps the
+    markdown, the queue empties and the zip auto-builds (last pending
+    gone -> gate open)."""
+    import zipfile
+    root = config.OUTPUT_ROOT
+    # give the solution row the same table so both copies carry it
+    sf = root / "split" / "TST" / "TST-001" / "solutions.jsonl"
+    srow = json.loads(sf.read_text().splitlines()[0])
+    srow["tables"] = [{"table_id": "T1", "markdown": MD,
+                       "source_pages": [10],
+                       "validation": {"table_qa": {"status": "REVIEW"}}}]
+    sf.write_text(json.dumps(srow) + "\n")
+    (root / "split" / "TST" / "TST-001" /
+     "chapter_completeness.json").write_text(json.dumps(
+        {"chapter_id": "TST-001", "census": {"ok": True},
+         "unresolved_qid_count": 0}))
+
+    r = client.post("/api/table/delete", json={
+        "book": "TST", "q_id": "TST-001-001", "table_id": "T1"})
+    j = r.get_json()
+    assert j["ok"] is True and j["copies"] == 2
+    assert j["zip_built"] is True          # gate opened by the delete
+    qf = root / "split" / "TST" / "TST-001" / "questions.jsonl"
+    assert json.loads(qf.read_text().splitlines()[0]).get("tables") == []
+    assert json.loads(sf.read_text().splitlines()[0]).get("tables") == []
+    assert client.get("/api/queue").get_json() == []
+    assert (root / "final_export_TST.zip").exists()
+    led = (root / "human_edit_ledger.jsonl").read_text()
+    assert "table_delete" in led and "gluedof" in led   # backup + audit
+
+
+def test_delete_table_not_found_and_ui(client):
+    r = client.post("/api/table/delete", json={
+        "book": "TST", "q_id": "TST-001-001", "table_id": "NOPE"})
+    assert r.get_json() == {"ok": False, "why": "table not found"}
+    r = client.post("/api/table/delete", json={"book": "TST"})
+    assert r.status_code == 400
+    html = client.get("/review").get_data(as_text=True)
+    assert "async function deleteTable(" in html
+    assert html.count("Delete table") >= 2   # queue + editor dono me
+    assert "/api/table/delete" in html       # wired to the endpoint
+
 
 def test_zip_missing_then_present(client):
     assert client.get("/zip/TST").status_code == 404

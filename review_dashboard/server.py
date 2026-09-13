@@ -161,6 +161,17 @@ class Handler(SimpleHTTPRequestHandler):
                 out = _maybe_export(body["book"])
                 res["zip_built"] = bool(out and out.get("ok"))
             return self._json(res)
+        if self.path == "/api/table/delete":
+            try:
+                res = review.delete_table(
+                    root, body["book"], body["q_id"], body["table_id"])
+            except KeyError as exc:
+                return self._json({"ok": False,
+                                   "why": f"missing field {exc}"}, 400)
+            if res.get("ok"):
+                out = _maybe_export(body["book"])
+                res["zip_built"] = bool(out and out.get("ok"))
+            return self._json(res)
         if self.path.startswith("/api/question/") \
                 and self.path.endswith("/edit"):
             qid = self.path[len("/api/question/"):-len("/edit")].strip("/")

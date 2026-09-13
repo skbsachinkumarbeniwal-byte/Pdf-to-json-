@@ -187,6 +187,8 @@ function tableEditor(d, t, holder){
       <textarea id="${id}">${esc(t.markdown||"")}</textarea>
       <button class="btn" onclick="saveTable('${esc(d.q.q_id)}',
         '${esc(d.book)}','${esc(t.table_id)}','${id}')">Save table</button>
+      <button class="btn bad" onclick="deleteTable('${esc(d.q.q_id)}',
+        '${esc(d.book)}','${esc(t.table_id)}')">Delete table</button>
       <span class="msg" id="${id}_m"></span>
     </details></div>`;
 }
@@ -277,6 +279,8 @@ function select(i){
     <button class="btn ok" onclick="decide('approve')">Approve as-is</button>
     <button class="btn" onclick="editMode()">Edit table</button>
     <button class="btn bad" onclick="decide('reject')">Reopen</button>
+    <button class="btn bad" onclick="deleteTable('${esc(it.q_id)}',
+      '${esc(it.book)}','${esc(it.table_id)}')">Delete table</button>
     <span class="msg" id="msg"></span>
     <div id="editor"></div>
     ${md2html(it.markdown, it.suspects)}
@@ -312,6 +316,22 @@ async function decide(action){
     body: JSON.stringify({book:it.book, q_id:it.q_id,
       table_id:it.table_id, action})});
   await load(); select(sel);
+}
+async function deleteTable(qid, book, tid){
+  if (!confirm("Table " + tid + " DELETE? Question aur solution dono " +
+      "copies se remove hogi (ledger me backup rehta hai).")) return;
+  const r = await fetch("/api/table/delete", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({book, q_id:qid, table_id:tid})});
+  const j = await r.json();
+  if (!j.ok){ alert("refused: " + (j.why || j.error || "?")); return; }
+  await load();
+  const d = await (await fetch("/api/question/" +
+    encodeURIComponent(qid))).json().catch(() => null);
+  if (d && d.q) showQuestion(d);
+  else document.getElementById("detail").innerHTML =
+    `<div class='note'>Table ${esc(tid)} deleted — queue refresh ho ` +
+    `gayi (${j.copies} copy/copies se hati).</div>`;
 }
 load();
 </script>

@@ -309,9 +309,10 @@ PDF, run extraction, watch the log, download the review-gated per-book `final_ex
 (one book, one gate, one zip). Two more surfaces hang off it:
 
 - `/review` — the human review dashboard: every REVIEW-flagged table,
-  printed-page crop beside the extracted JSON, in-place edit + approve.
-  Decisions persist in append-only ledgers and hold the export gate
-  until the queue is resolved.
+  printed-page crop beside the extracted JSON, in-place edit + approve
+  + delete (junk tables vanish from every copy; the ledger keeps a
+  backup). Decisions persist in append-only ledgers and hold the
+  export gate until the queue is resolved.
 - `/api/audit` — the post-run content audit report (numeric drift,
   duplicates, thin options, bad answer key); advisory flags only.
 

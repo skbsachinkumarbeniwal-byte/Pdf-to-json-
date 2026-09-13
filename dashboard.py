@@ -420,6 +420,23 @@ def _maybe_export(book: str | None = None) -> dict | None:
     return None
 
 
+@app.post("/api/table/delete")
+def api_table_delete():
+    """Delete ONE table (junk/garbage) from every copy of the question.
+    Deleting the last pending REVIEW table opens the gate, so the zip
+    is rebuilt right here."""
+    b = request.json or {}
+    try:
+        res = review_mod.delete_table(
+            config.OUTPUT_ROOT, b["book"], b["q_id"], b["table_id"])
+    except KeyError as exc:
+        return jsonify(ok=False, error=f"missing field {exc}"), 400
+    if res.get("ok"):
+        out = _maybe_export(b["book"])
+        res["zip_built"] = bool(out and out.get("ok"))
+    return jsonify(res)
+
+
 @app.post("/api/purge")
 def api_purge():
     """Free the volume for ONE shipped subject: deletes its split /
