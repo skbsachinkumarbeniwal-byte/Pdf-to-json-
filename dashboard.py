@@ -285,6 +285,7 @@ def api_status():
             size, found = 0, None
         has_split = (config.SPLIT_DIR / subj).is_dir()
         rows.append({
+            "has_split": has_split,
             "subject": subj,
             "file": found or entry.get("path"),
             "bytes": size,
@@ -407,6 +408,38 @@ def _maybe_export(book: str | None = None) -> dict | None:
     except Exception:                                # noqa: BLE001
         pass
     return None
+
+
+def _refine_runner(subject: str):
+    job = _jobs[subject]
+    try:
+        from qbank import refine as refine_mod
+        with redirect_stdout(_Tee(job)):
+            refine_mod.refine_subject(config.OUTPUT_ROOT, subject)
+        job["status"] = "done"
+    except Exception as exc:                       # noqa: BLE001
+        job["status"] = "error"
+        job["error"] = str(exc)
+
+
+@app.post("/api/refine")
+def api_refine():
+    """Gemini same-content rearrange of a book's flagged tables on the
+    existing split (no re-run). Refined tables re-enter the review
+    queue; the envelope rejects any invented content."""
+    b = request.get_json(silent=True) or {}
+    subj = (b.get("subject") or "").strip().upper()
+    if not subj:
+        return jsonify(ok=False, error="subject chahiye"), 400
+    if _jobs.get(subj, {}).get("status") == "running":
+        return jsonify(ok=False, error=f"{subj} already running"), 409
+    if not (config.SPLIT_DIR / subj).is_dir():
+        return jsonify(ok=False, error=f"{subj} ka extracted data "
+                                       f"nahi — pehle run karo"), 409
+    _jobs[subj] = {"status": "running", "error": None, "log": []}
+    threading.Thread(target=_refine_runner, args=(subj,),
+                     daemon=True).start()
+    return jsonify(ok=True, subject=subj)
 
 
 @app.post("/api/purge")
@@ -608,6 +641,15 @@ async function buildExport(s){
  if(!r.ok){alert("export refused: "+(r.error||"?"));return}
  refresh();
 }
+async function refineBook(s){
+ if(!confirm(s+": Gemini flagged tables ko same-content rule se "+
+   "refine kare? refined tables review me wapas aayengi."))return;
+ const r=await fetch("/api/refine",{method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({subject:s})}).then(r=>r.json());
+ if(!r.ok){alert(r.error||"refine failed");return}
+ refresh();
+}
 async function purgeBook(s){
  if(!confirm(s+": extracted data (split/assets/crops/review rows) delete "+
    "karein? final zip + PDF safe rahenge."))return;
@@ -652,6 +694,10 @@ async function refresh(){
      ?`<button class="sec" title="build ${b.subject} zip"
         onclick="buildExport('${b.subject}')">zip</button>`
      :"");
+  const rf=b.has_split
+   ?`<button class="sec" title="Gemini same-content refine — `+
+     `kharab tables ko same data se dobara arrange karo"
+      onclick="refineBook('${b.subject}')">&#10024;</button>`:"";
   const pg=b.zip
    ?`<button class="sec" title="purge ${b.subject} extracted data — `+
      `volume free karo, zip + PDF safe rahenge"
@@ -662,7 +708,7 @@ async function refresh(){
    <td><button ${st.running?"disabled":""}
      onclick="run('${b.subject}',false)">Run</button>
     <button class="sec" ${st.running?"disabled":""}
-     onclick="run('${b.subject}',true)">Re-run</button> ${zb} ${pg}</td></tr>`;
+     onclick="run('${b.subject}',true)">Re-run</button> ${zb} ${rf} ${pg}</td></tr>`;
  }).join("")||'<tr><td colspan=6 class="hint">no books yet</td></tr>';
  const locked=st.books.filter(b=>b.gate_locked===true);
  const ready=st.books.filter(b=>b.gate_locked===false);

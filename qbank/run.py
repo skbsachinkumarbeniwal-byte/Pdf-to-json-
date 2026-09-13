@@ -70,7 +70,8 @@ def _manifest_and_files(claims, subject: str, chapter_no: int):
 
 
 def run_chapter(book: Book, subject: str, ch, store: ImageStore,
-                output_root, vocab=None, llm=None, verify=None) -> dict:
+                output_root, vocab=None, llm=None, verify=None,
+                refine=None) -> dict:
     chapter_id = f"{subject}-{ch.chapter_no:03d}"
     t0 = time.time()
     scan = scan_chapter(book, ch.file_start, ch.file_end)
@@ -79,6 +80,13 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         book, scan, ch.chapter_no,
         page_range=(ch.file_start, ch.file_end), vocab=vocab, llm=llm,
         verify=verify)
+    if refine:
+        from . import refine as refine_mod
+        for rec in records.values():
+            for t in rec.get("tables") or []:
+                refine_mod.refine_table(
+                    t, book, refine,
+                    os.environ.get("QBANK_REFINE", "flagged"))
     anomalies = list(scan.anomalies) + list(extra_anoms)
     census = _census_summary(scan, anomalies)
 
@@ -192,11 +200,12 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
     from .tables import build_vocab
     vocab = build_vocab(book)   # book-wide evidence for space repairs
     book.drop_cache()           # vocab pass touched every page: free it
-    llm_fn = verify_fn = None
+    llm_fn = verify_fn = refine_fn = None
     from . import llm as llm_mod
     if llm_mod.enabled():
         llm_fn = llm_mod.transcriber(output_root / "llm_cache")
         verify_fn = llm_mod.verifier(output_root / "llm_cache")
+        refine_fn = llm_mod.refiner(output_root / "llm_cache")
         print(f"[{subject}] Gemini table pass enabled "
               f"(model {os.environ.get('QBANK_LLM_MODEL', llm_mod.DEFAULT_MODEL)})")
     chapters = parse_toc(book)
@@ -221,7 +230,7 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
             print(f"[{subject}] {chapter_id}: already done (resume)")
             continue
         res = run_chapter(book, subject, ch, store, output_root, vocab,
-                          llm_fn, verify_fn)
+                          llm_fn, verify_fn, refine_fn)
         results.append(res)
         for c in chapters_out:
             if c["chapter_id"] == chapter_id:

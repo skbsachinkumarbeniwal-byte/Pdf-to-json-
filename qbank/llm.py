@@ -543,3 +543,95 @@ def verifier(cache_dir: Path | None = None, model: str | None = None,
             cache.write_text(json.dumps(rows))
         return rows
     return verify
+
+
+REFINE_PROMPT = """You are rearranging a badly-arranged extraction of ONE
+medical-textbook table. A page image is attached ONLY as a layout
+reference (which cell belongs to which column/row).
+
+Return ONLY the rearranged pipe-markdown table (no fences, no prose).
+HARD RULES — "only same content of table":
+- Use ONLY the words/numbers already present in the extraction given
+  below. Add NOTHING: no new values, percentages, headers, rows,
+  columns, no medical knowledge, no synonyms.
+- Delete NOTHING: every word of the extraction must appear.
+- You MAY split glued fragments where the join is obvious from the
+  image (e.g. "ASCAOMP-C" -> "ASCA" | "OMP-C") and re-assign cells to
+  their proper columns/rows so the table reads like the printed one.
+- Keep medical terms, hyphens, units and capitalisation exactly as
+  printed in the extraction."""
+
+
+def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
+    """generateContent exchange returning raw text (markdown), with the
+    same pool/retry discipline as _call."""
+    rot, attempt = 0, 0
+    while attempt < 3:
+        try:
+            k = pool.acquire() if pool is not None else key
+            resp = _post(API.format(model=model), payload, k)
+            if pool is not None:
+                pool.note_call()
+        except urllib.error.HTTPError as e:
+            if pool is not None and e.code == 429 and rot < len(pool.keys):
+                try:
+                    body = e.read().decode("utf-8", "replace")
+                except Exception:
+                    body = ""
+                pool.note_429(body)
+                rot += 1
+                continue
+            return None
+        except Exception:
+            return None
+        cand = (resp.get("candidates") or [{}])[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        txt = "".join(pt.get("text", "") for pt in parts).strip()
+        if txt:
+            return re.sub(r"^```(?:markdown)?|```$", "", txt).strip()
+        attempt += 1
+    return None
+
+
+def refiner(cache_dir: Path | None = None, model: str | None = None,
+            key: str | None = None, pool=None):
+    """Return refine(book, pg, current_md) -> markdown | None.
+
+    Rearranges one flagged table with Gemini vision; the caller MUST
+    enforce the same-content envelope before accepting the result."""
+    pool = pool or (None if key else keypool.get_pool())
+    key = key or os.environ.get("GEMINI_API_KEY", "")
+    model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
+
+    def refine(book, pg: int, current_md: str) -> str | None:
+        cache = None
+        if cache_dir is not None:
+            sig = hashlib.sha1(
+                f"R3|{getattr(book.doc, 'name', '')}|{pg}|"
+                f"{hashlib.sha1(current_md.encode()).hexdigest()}"
+                .encode()).hexdigest()
+            cache = cache_dir / f"{sig}.json"
+            if cache.exists():
+                try:
+                    return json.loads(cache.read_text())
+                except Exception:
+                    pass
+        try:
+            pix = book.doc[pg - 1].get_pixmap(matrix=pymupdf.Matrix(2, 2))
+            b64 = base64.b64encode(pix.tobytes("png")).decode()
+            payload = {
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": b64}},
+                    {"text": REFINE_PROMPT + "\n\nExtraction:\n" +
+                     current_md}]}],
+                "generationConfig": {"temperature": 0.0,
+                                     "max_output_tokens": 8192},
+            }
+            txt = _call_text(pool, key, model, payload)
+        except Exception:
+            txt = None
+        if cache is not None and txt is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(txt))
+        return txt
+    return refine

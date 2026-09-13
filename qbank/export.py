@@ -141,6 +141,7 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
                 v for k, v in fixes.items() if k != "unknown_glyph")
 
     from . import review
+    from . import refine as refine_mod
     receipt = {
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "output_root": out_root.name,
@@ -149,6 +150,7 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
         "images_shipped": len(referenced),
         "review_decisions": len(review.load_decisions(out_root)),
         "human_edits": review.edit_count(out_root),
+        "tables_refined": refine_mod.refined_count(out_root, subject),
         "shipped_qa_status_counts": shipped_status or None,
         "glyph_fix_total": glyph_fix_total,
         "llm_tables_repaired": llm_tables,
