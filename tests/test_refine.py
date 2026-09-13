@@ -42,17 +42,16 @@ def test_rearrange_prompt_targets_book_artifacts():
 
 
 def test_rearrange_prompt_incompleteness_policy():
-    """Adoora extraction: restore from the PAGE IMAGE (source of
-    truth), never invent from model memory, never guess past a page
-    that is itself cut off."""
+    """Text-only refine: extraction is the only source — restore nothing
+    from memory, obvious mid-word joins are repair, cut-off stays
+    as-is (no guesswork)."""
     from qbank import llm as llm_mod
     p = llm_mod.REARRANGE_PROMPT
-    assert "source of truth" in p.lower()
-    assert "RESTORE" in p              # image se complete karna allowed
-    assert "INCOMPLETE" in p           # extraction adhoora ho to
-    assert "memory" in p               # apne knowledge se nahi
-    assert "not be invented" in p
-    assert "guesswork" in p            # page hi cut ho to as-is
+    assert "ONLY source" in p
+    assert "no page image" in p         # image bhejna band
+    assert "add NOTHING" in p           # apne knowledge se nahi
+    assert "repair, not addition" in p  # mid-word join allowed
+    assert "no guesswork" in p          # cut-off cell as-is
 
 
 def _stub(rows_by_md):
@@ -139,37 +138,32 @@ def test_refine_table_passes_all_source_pages(tmp_path):
     assert seen == [[10, 11, 12]]
 
 
-def test_refiner_sends_one_image_per_page(tmp_path, monkeypatch):
-    """The Gemini payload carries one inline image per spanned page and
-    the multi-page instruction."""
+def test_refiner_sends_text_only(tmp_path, monkeypatch):
+    """NO images: the payload carries ONLY the prompt + extracted
+    markdown; multi-page span note present, nothing rendered."""
     import qbank.llm as llm_mod
-    import qbank.textlayer as tl
-    from test_mini_book import _build_book
-    pdf = tmp_path / "m.pdf"
-    _build_book(pdf)
-    book = tl.Book(str(pdf))
     captured = {}
+    monkeypatch.setattr(
+        llm_mod, "_call_text",
+        lambda pool, key, model, payload:
+        captured.update(payload=payload) or REARRANGED)
 
-    def fake_call(pool, key, model, payload):
-        captured["payload"] = payload
-        return REARRANGED
-    monkeypatch.setattr(llm_mod, "_call_text", fake_call)
-
+    class DummyBook:                  # refiner touches book only for cache
+        class doc:
+            name = "m.pdf"
     rf = llm_mod.refiner(cache_dir=None, key="k")
-    out = rf(book, [2, 3], GLUED)                 # cross-page call
+    out = rf(DummyBook(), [2, 3], GLUED)          # cross-page call
     assert out == REARRANGED
     parts = captured["payload"]["contents"][0]["parts"]
-    imgs = [p for p in parts if "inline_data" in p]
-    assert len(imgs) == 2                          # dono pages gaye
-    ask = parts[-1]["text"]
-    assert "2 page images are attached" in ask     # span note
+    assert len(parts) == 1 and "inline_data" not in parts[0]
+    ask = parts[0]["text"]
+    assert GLUED in ask and "Extraction:" in ask  # extracted data gaya
+    assert "spanned 2 printed pages" in ask       # span note (text only)
     assert "ONE continuous table" in ask
-    # single-page call: one image, no span note
-    rf(book, [2], GLUED)
+    # single-page call: no span note
+    rf(DummyBook(), [2], GLUED)
     parts = captured["payload"]["contents"][0]["parts"]
-    assert len([p for p in parts if "inline_data" in p]) == 1
-    assert "page images are attached" not in parts[-1]["text"]
-    book.close()
+    assert "spanned" not in parts[0]["text"]
 
 
 def test_refine_off_switch(tmp_path, monkeypatch):

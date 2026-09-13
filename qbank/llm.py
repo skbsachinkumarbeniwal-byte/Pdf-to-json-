@@ -546,12 +546,11 @@ def verifier(cache_dir: Path | None = None, model: str | None = None,
 
 
 REARRANGE_PROMPT = """You are rearranging ONE medical-textbook table that
-was machine-extracted from PDF pages. One or more page images are
-attached as layout references, in reading order (a cross-page table
-arrives with ALL its pages).
+a deterministic pipeline extracted from a PDF's text layer. You receive
+ONLY the extracted pipe-markdown below — no page image.
 
-The extraction is full of layout artifacts because the PDF prints each
-visual line separately and narrow columns force mid-word wraps:
+The extraction is full of layout artifacts because narrow columns and
+line breaks print each visual line separately:
   * words broken across lines INSIDE a cell: "mylo hyoid" -> "mylohyoid",
     "digast ric" -> "digastric", "tens or veli palatini" ->
     "tensor veli palatini", "platys ma" -> "platysma",
@@ -575,24 +574,20 @@ SAME table rearranged so a medical student can read it:
 - header row first, every column properly headed, no split words in it;
 - every value in the cell it medically belongs to; every word whole
   (unwrapped, un-glued), natural single spaces, punctuation spaced;
-- where the printed table lists parallel entries inside one cell
+- where the extraction lists parallel entries inside one cell
   (multiple derivatives, multiple events), give each its own row or a
-  clearly separated list — judge from the image;
+  clearly separated list;
 - keep every fact, value, unit, abbreviation, roman numeral and
-  citation EXACTLY as printed ON THE PAGE: arrangement, wrapping and
+  citation EXACTLY as in the extraction: arrangement, wrapping and
   spacing may change, content may not.
 
-The PAGE IMAGE is the source of truth, not just a layout guide:
-- if the extraction is INCOMPLETE (a cut-off word, a dropped cell, a
-  missing row or column) but the content is visible on the page
-  image, RESTORE it from the image — completing printed content is
-  required, not a violation;
-- NEVER take content from your memory: what appears neither on the
-  image nor in the extraction must not be invented — no fact, no
-  word, no row from your own knowledge;
-- if the table continues onto a page that is NOT among the attached
-  images, keep exactly what is visible on the attached ones;
-  complete nothing by guesswork.
+The extraction is the ONLY source:
+- add NOTHING from your memory — no fact, no word, no row, no value
+  that is not already present in it;
+- completing an obvious mid-word split ("digast ric" -> "digastric")
+  is repair, not addition;
+- if a cell looks cut off (its continuation is simply not in the
+  extraction), keep exactly what is given; no guesswork.
 
 Return ONLY the rearranged pipe-markdown table (no fences, no prose),
 one row per line, every row with the same number of columns:
@@ -636,24 +631,22 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
             key: str | None = None, pool=None):
     """Return refine(book, pgs, current_md) -> markdown | None.
 
-    Runs DURING extraction for every extracted table: Gemini sees ALL
-    pages the table spans (cross-page tables arrive whole), rearranges
-    it per medical knowledge and the caller saves the returned
+    Runs DURING extraction for every extracted table. TEXT-ONLY: the
+    extracted pipe-markdown itself is what Gemini refines — no page
+    images are rendered or sent. The caller saves the returned
     markdown (validated only for table structure, not
     content-identity)."""
     pool = pool or (None if key else keypool.get_pool())
     key = key or os.environ.get("GEMINI_API_KEY", "")
     model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
-    max_pages = int(os.environ.get("QBANK_REFINE_MAX_PAGES", "4"))
 
     def refine(book, pgs, current_md: str) -> str | None:
         pgs = [int(p) for p in (pgs if isinstance(pgs, (list, tuple))
                                 else [pgs])] or [1]
-        pgs = pgs[:max_pages]
         cache = None
         if cache_dir is not None:
             sig = hashlib.sha1(
-                f"R5|{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
+                f"R6|{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
                 f"{hashlib.sha1(current_md.encode()).hexdigest()}"
                 .encode()).hexdigest()
             cache = cache_dir / f"{sig}.json"
@@ -662,28 +655,19 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
                     return json.loads(cache.read_text())
                 except Exception:
                     pass
+        ask = REARRANGE_PROMPT
+        if len(pgs) > 1:
+            ask += (f"\n\nThe extraction below covers a table that "
+                    f"spanned {len(pgs)} printed pages: treat it as "
+                    "ONE continuous table — the page break is just "
+                    "another artifact to repair.")
+        payload = {
+            "contents": [{"parts": [
+                {"text": ask + "\n\nExtraction:\n" + current_md}]}],
+            "generationConfig": {"temperature": 0.0,
+                                 "max_output_tokens": 8192},
+        }
         try:
-            parts = []
-            for pg in pgs:
-                pix = book.doc[pg - 1].get_pixmap(
-                    matrix=pymupdf.Matrix(2, 2))
-                parts.append({"inline_data": {
-                    "mime_type": "image/png",
-                    "data": base64.b64encode(
-                        pix.tobytes("png")).decode()}})
-            ask = REARRANGE_PROMPT
-            if len(pgs) > 1:
-                ask += (f"\n\n{len(pgs)} page images are attached, in "
-                        "reading order. This table spans them: treat "
-                        "the pages as ONE continuous table and "
-                        "rearrange across the whole span — the page "
-                        "break is itself an artifact to repair.")
-            parts.append({"text": ask + "\n\nExtraction:\n" + current_md})
-            payload = {
-                "contents": [{"parts": parts}],
-                "generationConfig": {"temperature": 0.0,
-                                     "max_output_tokens": 8192},
-            }
             txt = _call_text(pool, key, model, payload)
         except Exception:
             txt = None

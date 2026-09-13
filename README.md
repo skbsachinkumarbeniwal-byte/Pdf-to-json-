@@ -180,7 +180,8 @@ dashboard binds it and Railway exposes the public URL automatically.
    with `QBANK_LLM_MODEL`); a model cell is accepted ONLY when it is
    character-identical to the deterministic cell after whitespace
    removal; (b) during extraction EVERY extracted table is sent once
-   more for rearrangement — the model returns the table rearranged per
+   more for rearrangement — TEXT-ONLY, the extracted pipe-markdown
+   itself (no page images) — the model returns the table rearranged per
    medical knowledge (headers, cell placement, row order) and that
    markdown is what ships, with the original preserved under
    `validation.pre_gemini_markdown` (`QBANK_REFINE=flagged` narrows it

@@ -1,8 +1,8 @@
 """Gemini table rearrangement — runs DURING extraction, not after.
 
 Every table the deterministic pipeline extracts (question or solution,
-flagged or clean) is sent to Gemini once: the page image as layout
-reference plus the current pipe-markdown extraction, with the ask
+flagged or clean) is sent to Gemini once as TEXT — the current
+pipe-markdown extraction itself, no page images — with the ask
 "rearrange this table properly, per medical knowledge". The model's
 markdown is what gets SAVED on the table record:
 
@@ -80,8 +80,8 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
     if memo is not None and key in memo:
         new = memo[key]
     else:
-        # ALL pages the table spans go to the model (cross-page
-        # merged tables need both page images to be rearranged whole)
+        # the pages the table spans are passed for context only
+        # (cache key + multi-page span note) — no images are sent
         pgs = [int(p) for p in (t.get("source_pages") or [1])] or [1]
         new = refine_fn(book, pgs, md)
         if memo is not None:
