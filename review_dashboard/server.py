@@ -17,6 +17,19 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 
 from qbank import config, review  # noqa: E402
+from qbank.export import build_final_zip, gate_final_zip  # noqa: E402
+
+
+def _maybe_export(book: str):
+    """Same contract as the Railway dashboard: the moment this book's
+    last REVIEW table is decided its gate opens and its zip rebuilds,
+    so Download is ready without a re-run. Never raises."""
+    try:
+        if not gate_final_zip(config.OUTPUT_ROOT, book)["locked"]:
+            return build_final_zip(config.OUTPUT_ROOT, subject=book)
+    except Exception:                                # noqa: BLE001
+        pass
+    return None
 
 
 def _crop_file(name: str):
@@ -133,7 +146,10 @@ class Handler(SimpleHTTPRequestHandler):
             row = review.record_decision(
                 root, body["book"], body["q_id"], body["table_id"],
                 body.get("action", "approve"), body.get("note", ""))
-            return self._json(row)
+            out = _maybe_export(body["book"])
+            resp = dict(row)
+            resp["zip_built"] = bool(out and out.get("ok"))
+            return self._json(resp)
         if self.path == "/api/edit":
             res = review.apply_table_edit(
                 root, body["book"], body["q_id"], body["table_id"],
@@ -142,6 +158,8 @@ class Handler(SimpleHTTPRequestHandler):
                 review.record_decision(
                     root, body["book"], body["q_id"], body["table_id"],
                     body["action"], "saved via edit")
+                out = _maybe_export(body["book"])
+                res["zip_built"] = bool(out and out.get("ok"))
             return self._json(res)
         if self.path.startswith("/api/question/") \
                 and self.path.endswith("/edit"):

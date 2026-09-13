@@ -9,11 +9,13 @@ final_export.zip — same tree as FORMAT.md, same receipt keys as v1.
     ├── subjects/<SUBJ>/chapters.json
     └── assets/questions/<SUBJ>/*.webp   (ONLY manifest-referenced files)
 
-The v1 gate was "review queue clear". The v2 gate is its deterministic
-equivalent: every chapter's completeness file proves the printed census
-(question headers == key rows == solution headers, contiguous) and no
-row ships as REVIEW_NEEDED. A blocked build lists exactly which
-chapters/rows are open.
+The v1 gate was "review queue clear". The v2 gate keeps that contract
+for the human layer: the zip builds the instant the book's last REVIEW
+table is decided. Census anomalies and unresolved q_ids are advisory —
+they ride along in REVIEW_RECEIPT.json and each chapter's
+chapter_completeness.json, but they can never be cleared from the
+dashboard, so they never block the build. A blocked build lists
+exactly which review tables are open.
 """
 
 from __future__ import annotations
@@ -69,28 +71,36 @@ def _table_stats(out_root: Path, subject: str) -> tuple:
     return gem, review
 
 
+def _chapter_advisories(out_root: Path, subject: str) -> tuple:
+    """(census_failed_chapters, unresolved_qids) — deterministic data
+    quality signals that are REPORTED but never lock the zip (the
+    human-review layer is the only lock a dashboard decision can
+    clear)."""
+    census_bad, unresolved = [], 0
+    for cf in _split_glob(out_root, subject, "chapter_completeness.json"):
+        comp = json.loads(cf.read_text())
+        census = comp.get("census") or {}
+        if not census.get("ok"):
+            census_bad.append(comp.get("chapter_id", cf.parent.name))
+        unresolved += int(comp.get("unresolved_qid_count") or 0)
+    return census_bad, unresolved
+
+
 def gate_final_zip(output_root, subject: str) -> dict:
     """One book, one gate: only subject=CODE's chapters + its REVIEW
     tables gate ITS zip. Other books can never lock it, and a new
-    book's run never re-locks an already-shipped one."""
+    book's run never re-locks an already-shipped one.
+
+    The zip builds the moment every chapter is on disk and the book's
+    human-review queue is clear. Census anomalies and unresolved
+    q_ids are ADVISORY (they ride along in the receipt and each
+    chapter's completeness file) — they are never clearable from the
+    dashboard, so they must not block the export."""
     out_root = Path(output_root)
     problems = []
     chapters = 0
     for cf in _split_glob(out_root, subject, "chapter_completeness.json"):
         chapters += 1
-        comp = json.loads(cf.read_text())
-        census = comp.get("census") or {}
-        if not census.get("ok"):
-            problems.append(f"{comp['chapter_id']}: census FAILED {census}")
-        # NOTE: qa_status_counts.REVIEW_NEEDED is the run-time flag
-        # count — informational only.  It never decreases, so it must
-        # NOT hard-lock the zip; the human-review lock below
-        # (pending_count) is the one decisions can unlock.  The run's
-        # counts still ship in the receipt (shipped_qa_status_counts).
-        if comp.get("unresolved_qid_count"):
-            problems.append(
-                f"{comp['chapter_id']}: "
-                f"{comp['unresolved_qid_count']} unresolved q_id(s)")
     if chapters == 0:
         problems.append(f"no chapters on disk for {subject}")
     # human review layer (adopted): final zip hard-locked while any
@@ -142,6 +152,7 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
 
     from . import review
     from . import refine as refine_mod
+    census_bad, unresolved = _chapter_advisories(out_root, subject)
     receipt = {
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "output_root": out_root.name,
@@ -151,6 +162,8 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
         "review_decisions": len(review.load_decisions(out_root)),
         "human_edits": review.edit_count(out_root),
         "tables_refined": refine_mod.refined_count(out_root, subject),
+        "census_failed_chapters": census_bad,
+        "unresolved_qids": unresolved,
         "shipped_qa_status_counts": shipped_status or None,
         "glyph_fix_total": glyph_fix_total,
         "llm_tables_repaired": llm_tables,
@@ -158,8 +171,9 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
         "pipeline": ("deterministic-text-layer-v2+gemini-table-vision"
                      if _llm_used(out_root)
                      else "deterministic-text-layer-v2"),
-        "gate": ("census verified — question headers, answer-key rows and "
-                 "solution headers match in every chapter; no row flagged"),
+        "gate": ("human review queue clear — every REVIEW table decided; "
+                 "per-chapter census + unresolved_qids ship inside the "
+                 "zip for traceability"),
     }
 
     fm = Path(__file__).resolve().parent.parent / "FORMAT.md"

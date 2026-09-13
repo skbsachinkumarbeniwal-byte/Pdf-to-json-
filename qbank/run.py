@@ -80,13 +80,22 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         book, scan, ch.chapter_no,
         page_range=(ch.file_start, ch.file_end), vocab=vocab, llm=llm,
         verify=verify)
-    if refine:
+    refine_only = os.environ.get("QBANK_REFINE", "all")
+    if refine and refine_only != "off":
+        # in-extraction Gemini pass: EVERY extracted table is sent to
+        # the model (QBANK_REFINE=flagged narrows it to REVIEW-flagged
+        # ones; QBANK_REFINE=off disables). The rearranged markdown is
+        # saved on the table; flagged tables still queue for review.
         from . import refine as refine_mod
-        for rec in records.values():
+        ledger = Path(output_root) / "data" / refine_mod.LEDGER
+        memo: dict = {}
+        for qn, rec in records.items():
+            qid = f"{subject}-{ch.chapter_no:03d}-{qn:03d}"
             for t in rec.get("tables") or []:
                 refine_mod.refine_table(
-                    t, book, refine,
-                    os.environ.get("QBANK_REFINE", "flagged"))
+                    t, book, refine, refine_only, memo,
+                    ledger_key=f"{subject}|{qid}|{t.get('table_id')}",
+                    ledger_path=ledger)
     anomalies = list(scan.anomalies) + list(extra_anoms)
     census = _census_summary(scan, anomalies)
 

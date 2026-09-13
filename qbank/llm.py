@@ -545,21 +545,30 @@ def verifier(cache_dir: Path | None = None, model: str | None = None,
     return verify
 
 
-REFINE_PROMPT = """You are rearranging a badly-arranged extraction of ONE
-medical-textbook table. A page image is attached ONLY as a layout
-reference (which cell belongs to which column/row).
+REARRANGE_PROMPT = """You are rearranging ONE medical-textbook table that
+was machine-extracted from a PDF page. The page image is attached as a
+layout reference (which cell printed where).
 
-Return ONLY the rearranged pipe-markdown table (no fences, no prose).
-HARD RULES — "only same content of table":
-- Use ONLY the words/numbers already present in the extraction given
-  below. Add NOTHING: no new values, percentages, headers, rows,
-  columns, no medical knowledge, no synonyms.
-- Delete NOTHING: every word of the extraction must appear.
-- You MAY split glued fragments where the join is obvious from the
-  image (e.g. "ASCAOMP-C" -> "ASCA" | "OMP-C") and re-assign cells to
-  their proper columns/rows so the table reads like the printed one.
-- Keep medical terms, hyphens, units and capitalisation exactly as
-  printed in the extraction."""
+The extraction is often badly arranged: values under the wrong header,
+the header row misplaced or missing its columns, glued fragments
+("ASCAOMP-C"), rows in a confusing order.
+
+Using your MEDICAL KNOWLEDGE of what this table describes, return the
+SAME table rearranged so a medical student can read it:
+- put the header row first and give every column its proper heading;
+- move each value under the header it medically belongs to;
+- split glued fragments where the join is obvious from the image
+  (e.g. "ASCAOMP-C" -> "ASCA" | "OMP-C") and repair spacing;
+- order rows/sections the way the clinical concept dictates
+  (e.g. normal values before abnormal, cause before effect);
+- keep medical terminology, units, hyphens and capitalisation natural
+  and correct.
+
+Return ONLY the rearranged pipe-markdown table (no fences, no prose),
+one row per line, every row with the same number of columns:
+| Header | Header |
+|---|---|
+| ... | ... |"""
 
 
 def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
@@ -597,8 +606,9 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
             key: str | None = None, pool=None):
     """Return refine(book, pg, current_md) -> markdown | None.
 
-    Rearranges one flagged table with Gemini vision; the caller MUST
-    enforce the same-content envelope before accepting the result."""
+    Runs DURING extraction for every extracted table: Gemini rearranges
+    it per medical knowledge and the caller saves the returned markdown
+    (validated only for table structure, not content-identity)."""
     pool = pool or (None if key else keypool.get_pool())
     key = key or os.environ.get("GEMINI_API_KEY", "")
     model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
@@ -607,7 +617,7 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
         cache = None
         if cache_dir is not None:
             sig = hashlib.sha1(
-                f"R3|{getattr(book.doc, 'name', '')}|{pg}|"
+                f"R4|{getattr(book.doc, 'name', '')}|{pg}|"
                 f"{hashlib.sha1(current_md.encode()).hexdigest()}"
                 .encode()).hexdigest()
             cache = cache_dir / f"{sig}.json"
@@ -622,7 +632,7 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
             payload = {
                 "contents": [{"parts": [
                     {"inline_data": {"mime_type": "image/png", "data": b64}},
-                    {"text": REFINE_PROMPT + "\n\nExtraction:\n" +
+                    {"text": REARRANGE_PROMPT + "\n\nExtraction:\n" +
                      current_md}]}],
                 "generationConfig": {"temperature": 0.0,
                                      "max_output_tokens": 8192},
