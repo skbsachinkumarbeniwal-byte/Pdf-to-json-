@@ -41,6 +41,20 @@ def test_rearrange_prompt_targets_book_artifacts():
     assert "EXACTLY" in p              # content must not change
 
 
+def test_rearrange_prompt_incompleteness_policy():
+    """Adoora extraction: restore from the PAGE IMAGE (source of
+    truth), never invent from model memory, never guess past a page
+    that is itself cut off."""
+    from qbank import llm as llm_mod
+    p = llm_mod.REARRANGE_PROMPT
+    assert "source of truth" in p.lower()
+    assert "RESTORE" in p              # image se complete karna allowed
+    assert "INCOMPLETE" in p           # extraction adhoora ho to
+    assert "memory" in p               # apne knowledge se nahi
+    assert "not be invented" in p
+    assert "guesswork" in p            # page hi cut ho to as-is
+
+
 def _stub(rows_by_md):
     calls = []
 

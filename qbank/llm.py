@@ -578,8 +578,19 @@ SAME table rearranged so a medical student can read it:
   (multiple derivatives, multiple events), give each its own row or a
   clearly separated list — judge from the image;
 - keep every fact, value, unit, abbreviation, roman numeral and
-  citation EXACTLY as printed: change NOTHING about the content, only
-  its arrangement, wrapping and spacing.
+  citation EXACTLY as printed ON THE PAGE: arrangement, wrapping and
+  spacing may change, content may not.
+
+The PAGE IMAGE is the source of truth, not just a layout guide:
+- if the extraction is INCOMPLETE (a cut-off word, a dropped cell, a
+  missing row or column) but the content is visible on the page
+  image, RESTORE it from the image — completing printed content is
+  required, not a violation;
+- NEVER take content from your memory: what appears neither on the
+  image nor in the extraction must not be invented — no fact, no
+  word, no row from your own knowledge;
+- if the page itself is cut off (the table continues on another
+  page), keep exactly what is visible; complete nothing by guesswork.
 
 Return ONLY the rearranged pipe-markdown table (no fences, no prose),
 one row per line, every row with the same number of columns:
