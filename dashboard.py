@@ -312,7 +312,13 @@ def api_status():
                                             time.localtime(
                                                 z.stat().st_mtime)),
                      "receipt": rc}
+    from qbank import llm as llm_mod
+    from qbank import keypool
     return jsonify(books=rows, zips=zips,
+                   gemini={"enabled": llm_mod.enabled(),
+                           "keys": len(keypool.discover_keys()),
+                           "model": os.environ.get(
+                               "QBANK_LLM_MODEL", llm_mod.DEFAULT_MODEL)},
                    running=any(j["status"] == "running"
                                for j in _jobs.values()),
                    jobs={s: {"status": j["status"], "error": j["error"]}
@@ -567,8 +573,10 @@ PAGE = """<!doctype html>
  .hint{color:var(--dim);font-size:12px}
  .big{font-size:15px}
 </style></head><body><div class="wrap">
-<h1>Jdon Extract <span style="color:var(--ac)">v2</span></h1>
-<p class="sub">deterministic text-layer pipeline &middot; zero LLM &middot;
+<h1>Jdon Extract <span style="color:var(--ac)">v2</span>
+ <span id="gembadge"></span></h1>
+<p class="sub">deterministic text-layer pipeline &middot; table refine:
+Gemini &middot;
 upload PDF &rarr; extract &rarr; review &rarr; download final_export_<CODE>.zip</p>
 
 <div class="row" style="margin-bottom:18px">
@@ -667,6 +675,10 @@ async function run(s,force){
 }
 async function refresh(){
  const st=await fetch("/api/status").then(r=>r.json());
+ const g=st.gemini||{};
+ $('gembadge').innerHTML=g.enabled
+  ?'<span class="badge b-ok">GEMINI ON</span>'
+  :'<span class="badge b-err">GEMINI OFF — '+(g.keys?'LLM disabled':'no API key')+', tables raw rahengi</span>';
  $('books').innerHTML=st.books.map(b=>{
   const j=b.job;
   const badge=j==="running"?'<span class="badge b-run">RUNNING</span>'

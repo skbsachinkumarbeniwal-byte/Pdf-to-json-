@@ -143,6 +143,12 @@ def test_delete_table_not_found_and_ui(client):
     assert "/api/table/delete" in html       # wired to the endpoint
 
 
+def test_status_exposes_gemini_state(client):
+    st = client.get("/api/status").get_json()
+    assert "gemini" in st
+    assert set(st["gemini"]) == {"enabled", "keys", "model"}
+
+
 def test_zip_missing_then_present(client):
     assert client.get("/zip/TST").status_code == 404
     zp = config.OUTPUT_ROOT / "final_export_TST.zip"

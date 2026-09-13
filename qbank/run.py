@@ -89,13 +89,21 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         from . import refine as refine_mod
         ledger = Path(output_root) / "data" / refine_mod.LEDGER
         memo: dict = {}
+        stats: dict = {}
         for qn, rec in records.items():
             qid = f"{subject}-{ch.chapter_no:03d}-{qn:03d}"
             for t in rec.get("tables") or []:
-                refine_mod.refine_table(
+                st = refine_mod.refine_table(
                     t, book, refine, refine_only, memo,
                     ledger_key=f"{subject}|{qid}|{t.get('table_id')}",
                     ledger_path=ledger)
+                stats[st] = stats.get(st, 0) + 1
+        # loud per-chapter visibility: kabhi kuch bhi silently na ho
+        print(f"[{subject}] {chapter_id}: Gemini refine — "
+              f"{stats.get('replaced', 0)} rearranged, "
+              f"{stats.get('same', 0)} unchanged, "
+              f"{stats.get('empty', 0)} no-answer, "
+              f"{stats.get('invalid', 0)} invalid (original kept)")
     anomalies = list(scan.anomalies) + list(extra_anoms)
     census = _census_summary(scan, anomalies)
 
@@ -217,6 +225,12 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
         refine_fn = llm_mod.refiner(output_root / "llm_cache")
         print(f"[{subject}] Gemini table pass enabled "
               f"(model {os.environ.get('QBANK_LLM_MODEL', llm_mod.DEFAULT_MODEL)})")
+    else:
+        from . import keypool
+        why = ("QBANK_LLM_TABLES=0" if keypool.discover_keys()
+               else "no GEMINI_API_KEY in env")
+        print(f"[{subject}] *** Gemini DISABLED ({why}) — tables ka "
+              f"rearrange NAHI hoga, raw extraction jayegi ***")
     chapters = parse_toc(book)
     assign_file_ranges(chapters, int(page_offset), book.total_pages)
     print(f"[{subject}] {book.total_pages} pages, offset "
