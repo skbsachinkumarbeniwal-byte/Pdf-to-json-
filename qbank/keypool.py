@@ -35,6 +35,10 @@ from pathlib import Path
 # keep using the rest of the pool.
 RPM_COOLDOWN_SECONDS = 60
 DEFAULT_MAX_CALLS_PER_DAY = 480
+# The free tier allows 15 requests/minute per project: pace every key
+# at 12 so bursts never trip a 429 (env QBANK_MAX_CALLS_PER_MINUTE
+# overrides; N keys sustain N x the rate).
+DEFAULT_MAX_CALLS_PER_MINUTE = 12
 
 
 def _fp(key: str) -> str:
@@ -67,9 +71,15 @@ class PoolExhausted(RuntimeError):
 
 class KeyPool:
     def __init__(self, keys, max_calls_per_day=DEFAULT_MAX_CALLS_PER_DAY,
-                 state_path=None):
+                 state_path=None,
+                 max_calls_per_minute=DEFAULT_MAX_CALLS_PER_MINUTE):
         self.keys = list(keys)
         self.max_calls = int(max_calls_per_day)
+        self.max_minute = int(max_calls_per_minute)
+        # rolling-60s call stamps per key: pacing state only, in-memory
+        # (a 60 s window is meaningless across processes, so unlike the
+        # daily counters it is never persisted to keypool_state.json)
+        self._min = {f"key{i + 1}": [] for i in range(len(self.keys))}
         self.state_path = Path(state_path) if state_path else None
         self.day = time.strftime("%Y-%m-%d")
         self.st = {
@@ -120,28 +130,54 @@ class KeyPool:
         return f"key{(self.active if idx is None else idx) + 1}"
 
     # ---- rotation -----------------------------------------------------
+    def _minute_wait(self, idx: int, now: float) -> float:
+        """Seconds until this key has per-minute room (0 = right now).
+        The rolling 60 s window keeps every key under the API's 15/min
+        rate — the pool waits instead of tripping 429s."""
+        stamps = [t for t in self._min[self.label(idx)] if now - t < 60.0]
+        self._min[self.label(idx)] = stamps
+        if len(stamps) < self.max_minute:
+            return 0.0
+        return max(0.0, 60.0 - (now - stamps[0]))
+
     def acquire(self) -> str:
         """The current usable key, advancing past exhausted/cooldown
-        keys. Raises PoolExhausted when the whole pool is spent."""
+        keys and preferring one with per-minute room. When every usable
+        key is merely pacing-capped, waits for the window to slide;
+        raises PoolExhausted only when no key can serve at all (daily
+        caps spent or every key cooling down)."""
         self._rollover()
-        now = time.time()
-        for i in range(len(self.keys)):
-            idx = (self.active + i) % len(self.keys)
-            s = self.st[self.label(idx)]
-            if s["status"] == "exhausted":
-                continue
-            if s["status"] == "cooldown" and s["cooldown_until"] > now:
-                continue
-            if s["calls"] >= self.max_calls:
-                s["status"] = "exhausted"
-                continue
-            self.active = idx
-            return self.keys[idx]
-        raise PoolExhausted(f"all {len(self.keys)} keys spent today")
+        while True:
+            now = time.time()
+            waits = []
+            for i in range(len(self.keys)):
+                idx = (self.active + i) % len(self.keys)
+                s = self.st[self.label(idx)]
+                if s["status"] == "exhausted":
+                    continue
+                if s["status"] == "cooldown" and s["cooldown_until"] > now:
+                    continue
+                if s["calls"] >= self.max_calls:
+                    s["status"] = "exhausted"
+                    continue
+                w = self._minute_wait(idx, now)
+                if w > 0:
+                    waits.append(w)
+                    continue
+                self.active = idx
+                return self.keys[idx]
+            if not waits:
+                raise PoolExhausted(f"all {len(self.keys)} keys spent today")
+            wait = min(waits)
+            print(f"[keypool] pacing cap ({self.max_minute}/min per key) "
+                  f"hit on every usable key — waiting {wait:.1f}s",
+                  flush=True)
+            time.sleep(wait)
 
     def note_call(self):
         s = self.st[self.label()]
         s["calls"] += 1
+        self._min[self.label()].append(time.time())   # pacing window
         if s["calls"] >= self.max_calls:
             s["status"] = "exhausted"
             print(f"[keypool] {self.label()} (fp {s['fp']}) hit daily cap "
@@ -166,10 +202,21 @@ class KeyPool:
                   f"exhausted — advancing")
         self._save()
 
+    def note_bad_key(self, code: int, err_text: str = ""):
+        """This key was rejected for THIS run (revoked key, quota 403,
+        per-project block): park it and advance — the next key in the
+        pool may still serve."""
+        s = self.st[self.label()]
+        s["status"] = "exhausted"
+        print(f"[keypool] {self.label()} (fp {s['fp']}) rejected by the "
+              f"API (HTTP {code}) — advancing to the next key")
+        self._save()
+
     # ---- reporting -----------------------------------------------------
     def summary(self) -> dict:
         return {"day": self.day, "active": self.label(),
                 "max_calls_per_day": self.max_calls,
+                "max_calls_per_minute": self.max_minute,
                 "keys": [{"label": l, **v} for l, v in sorted(self.st.items())]}
 
     def summary_text(self) -> str:
@@ -188,11 +235,15 @@ def get_pool(output_root=None, env=None) -> KeyPool | None:
         if keys:
             root = Path(output_root
                         or os.environ.get("OUTPUT_DIR", ".")).expanduser()
-            _POOL = KeyPool(
-                keys,
-                int(os.environ.get("QBANK_MAX_CALLS_PER_DAY",
-                                   str(DEFAULT_MAX_CALLS_PER_DAY))),
-                state_path=root / "data" / "keypool_state.json")
+            day = int(os.environ.get("QBANK_MAX_CALLS_PER_DAY",
+                                     str(DEFAULT_MAX_CALLS_PER_DAY)))
+            minute = int(os.environ.get(
+                "QBANK_MAX_CALLS_PER_MINUTE",
+                str(DEFAULT_MAX_CALLS_PER_MINUTE)))
+            _POOL = KeyPool(keys, day,
+                            state_path=root / "data" / "keypool_state.json",
+                            max_calls_per_minute=minute)
             print(f"[keypool] {len(keys)} key(s) in pool "
-                  f"(fps: {', '.join(v['fp'] for v in _POOL.st.values())})")
+                  f"(fps: {', '.join(v['fp'] for v in _POOL.st.values())}); "
+                  f"pacing {minute}/min/key, cap {day}/day/key")
     return _POOL

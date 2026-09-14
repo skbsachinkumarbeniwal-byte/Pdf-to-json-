@@ -318,7 +318,12 @@ for rearranging, doubled automatically when an answer hits the cap);
 `QBANK_REFINE=flagged|off` narrows/disables the rearrangement;
 `QBANK_LLM_PREFLIGHT=0` skips the startup model check;
 `QBANK_MAX_CALLS_PER_DAY` caps calls per key (pool state in
-`<output>/data/keypool_state.json`).
+`<output>/data/keypool_state.json`); `QBANK_MAX_CALLS_PER_MINUTE`
+paces each key (default 12 — safe boundary under the 15/min
+free-tier rate; the pool waits instead of tripping 429s, preferring
+a key that still has room so N keys sustain N× the rate). A key
+that hits its daily cap, gets a 429/quota error, or is rejected as
+invalid is skipped automatically — the next key serves instead.
 
 ### Dashboard par GEMINI ON hai par tables raw aa rahi hain?
 

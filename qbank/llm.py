@@ -414,6 +414,17 @@ _HTTP_HINTS = {
 }
 
 
+def _http_detail_text(code: int, body: str) -> str:
+    """'HTTP 404 NOT_FOUND models/x is not found' from pre-read parts —
+    the key is never in the URL or the body, so this is safe to print."""
+    try:
+        err = json.loads(body).get("error") or {}
+        return (f"HTTP {code} {err.get('status', '')} "
+                f"{err.get('message', '')}").strip()[:400]
+    except Exception:                          # noqa: BLE001
+        return f"HTTP {code} {body.strip()[:300]}".strip()
+
+
 def _http_detail(e) -> str:
     """'HTTP 404 NOT_FOUND models/x is not found' — the key is never in
     the URL or the body, so this is safe to print."""
@@ -421,12 +432,7 @@ def _http_detail(e) -> str:
         body = e.read().decode("utf-8", "replace")
     except Exception:                          # noqa: BLE001
         body = ""
-    try:
-        err = json.loads(body).get("error") or {}
-        return (f"HTTP {e.code} {err.get('status', '')} "
-                f"{err.get('message', '')}").strip()[:400]
-    except Exception:                          # noqa: BLE001
-        return f"HTTP {e.code} {body.strip()[:300]}".strip()
+    return _http_detail_text(e.code, body)
 
 
 def report_error(what: str, detail: str, hint: str = "") -> None:
@@ -442,6 +448,24 @@ def report_error(what: str, detail: str, hint: str = "") -> None:
 
 def _hint_for(code: int) -> str:
     return _HTTP_HINTS.get(code, "")
+
+
+def _key_fault(code: int, body: str) -> bool:
+    """True when the failure blames THIS key rather than the request —
+    a revoked key, a quota 403, a per-project block. The next pool key
+    may still serve, so rotate instead of giving up. Anything else (a
+    bad model id, a malformed request) would fail identically on every
+    key, so those report once and stop without burning the pool."""
+    low = (body or "").lower()
+    if code in (400, 401):
+        return ("api key" in low or "api_key" in low or "apikey" in low
+                or "credential" in low or "unauthorized" in low
+                or "unauthenticated" in low)
+    if code == 403:
+        return ("quota" in low or "exhaust" in low or "rate" in low
+                or "limit" in low or "permission" in low
+                or "forbidden" in low or "api key" in low)
+    return False
 
 
 def reset_error_reports() -> None:
@@ -503,7 +527,8 @@ def _bump_cap(payload: dict) -> dict:
 def _call(pool, key: str, model: str, payload: dict):
     """One generateContent exchange with pool-aware key rotation.
     Returns the parsed rows or None — the caller keeps the
-    deterministic output. A 429 that survives _post's burst retries
+    deterministic output. A 429 that survives _post's burst retries —
+    or a failure that blames the key itself (revoked key, quota 403) —
     rotates to the next pool key (bounded by pool size) without
     spending a parse-retry attempt; anything else gives up on the
     spot (loudly — see report_error)."""
@@ -515,18 +540,29 @@ def _call(pool, key: str, model: str, payload: dict):
             if pool is not None:
                 pool.note_call()
         except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:              # noqa: BLE001
+                body = ""
             if pool is not None and e.code == 429 and rot < len(pool.keys):
-                try:
-                    body = e.read().decode("utf-8", "replace")
-                except Exception:              # noqa: BLE001
-                    body = ""
                 pool.note_429(body)
                 rot += 1
                 continue
-            report_error(f"{model} call failed", _http_detail(e),
-                         _hint_for(e.code))
+            if pool is not None and rot < len(pool.keys) \
+                    and _key_fault(e.code, body):
+                pool.note_bad_key(e.code, body)   # next key may serve
+                rot += 1
+                continue
+            report_error(f"{model} call failed",
+                         _http_detail_text(e.code, body), _hint_for(e.code))
             return None
-        except Exception as e:   # network dead / PoolExhausted: det output
+        except keypool.PoolExhausted as e:
+            report_error(f"{model} pool exhausted", str(e),
+                         "no usable key left (daily caps spent, keys "
+                         "rejected, or every key cooling down) — "
+                         "deterministic output for now")
+            return None
+        except Exception as e:   # network dead: det output
             report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
                          "network unreachable from this host?")
             return None
@@ -779,16 +815,27 @@ def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
             if pool is not None:
                 pool.note_call()
         except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:              # noqa: BLE001
+                body = ""
             if pool is not None and e.code == 429 and rot < len(pool.keys):
-                try:
-                    body = e.read().decode("utf-8", "replace")
-                except Exception:              # noqa: BLE001
-                    body = ""
                 pool.note_429(body)
                 rot += 1
                 continue
-            report_error(f"{model} call failed", _http_detail(e),
-                         _hint_for(e.code))
+            if pool is not None and rot < len(pool.keys) \
+                    and _key_fault(e.code, body):
+                pool.note_bad_key(e.code, body)   # next key may serve
+                rot += 1
+                continue
+            report_error(f"{model} call failed",
+                         _http_detail_text(e.code, body), _hint_for(e.code))
+            return None
+        except keypool.PoolExhausted as e:
+            report_error(f"{model} pool exhausted", str(e),
+                         "no usable key left (daily caps spent, keys "
+                         "rejected, or every key cooling down) — "
+                         "deterministic output for now")
             return None
         except Exception as e:                 # noqa: BLE001
             report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
