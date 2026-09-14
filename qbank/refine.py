@@ -65,6 +65,77 @@ def flagged(t: dict) -> bool:
             .get("status") == "REVIEW")
 
 
+# Models answer a "return ONLY the table" prompt with a sentence of
+# preamble, a fence, or a closing remark surprisingly often. Throwing
+# the whole rearrangement away for that cosmetically broke the pass
+# (the run showed "invalid" and shipped raw tables). ONE unambiguous
+# table block is salvaged; anything ambiguous is still refused —
+# arrangement is the model's job, guessing is not.
+def salvage_table(text: str) -> str | None:
+    """The single pipe-table block inside a chatty answer, or None.
+    Refuses when the answer contains more than one block (which table
+    is the table is then genuinely unclear)."""
+    if not text:
+        return None
+    lines = [l for l in text.splitlines()
+             if not re.fullmatch(r"\s*`{3,}[A-Za-z]*\s*", l or "")]
+    runs, cur = [], []
+    for line in lines:
+        if re.fullmatch(r"\s*\|.*\|\s*", line):
+            cur.append(line.strip())
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    runs = [r for r in runs if len(r) >= 3]      # header + sep + 1 row
+    if len(runs) != 1:
+        return None
+    cand = "\n".join(runs[0])
+    return cand if valid_rearrangement(cand) else None
+
+
+# A rejected answer used to be invisible: the stats line said
+# "N invalid" and nobody could tell WHAT the model had sent. Show the
+# first few, then stay quiet — a hundred of them would drown the log.
+REJECT_SAMPLES = 3
+_reject_samples_left = REJECT_SAMPLES
+
+
+SALVAGE_SAMPLES = 3
+_salvage_samples_left = SALVAGE_SAMPLES
+
+
+def reset_samples() -> None:
+    """Give a new run its own sample budget: the counters are process
+    globals, so without this the second book in a long-lived dashboard
+    process would log no samples at all."""
+    global _reject_samples_left, _salvage_samples_left
+    _reject_samples_left = REJECT_SAMPLES
+    _salvage_samples_left = SALVAGE_SAMPLES
+
+
+def _note_salvage(t: dict) -> None:
+    global _salvage_samples_left
+    if _salvage_samples_left <= 0:
+        return
+    _salvage_samples_left -= 1
+    print(f"[gemini] {(t.get('table_id') or '?')}: answer had wrapper text "
+          f"(prose/fences) — salvaged the single table block from it",
+          flush=True)
+
+
+def _note_reject(t: dict, answer: str) -> None:
+    global _reject_samples_left
+    if _reject_samples_left <= 0:
+        return
+    _reject_samples_left -= 1
+    head = " / ".join((answer or "").strip().splitlines()[:2])[:200]
+    print(f"[gemini] {(t.get('table_id') or '?')}: answer rejected — not an "
+          f"even pipe-markdown table, deterministic one kept. "
+          f"Answer starts: {head!r}", flush=True)
+
+
 def refine_table(t: dict, book, refine_fn, only: str = "all",
                  memo: dict | None = None, ledger_key: str | None = None,
                  ledger_path: Path | None = None) -> str:
@@ -90,12 +161,20 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
         return "empty"         # model returned nothing usable
     if new.strip() == md.strip():
         return "same"          # model returned the extraction as-is
+    salvaged = False
     if not valid_rearrangement(new):
-        return "invalid"       # not a table: keep the deterministic one
+        block = salvage_table(new)
+        if block is None:
+            _note_reject(t, new)
+            return "invalid"   # not a table: keep the deterministic one
+        new, salvaged = block, True
+        _note_salvage(t)
     val = t.setdefault("validation", {})
     val.setdefault("pre_gemini_markdown", md)
     qa = val.setdefault("table_qa", {})
     qa["refined_by_gemini"] = True
+    if salvaged:
+        qa["salvaged_from_wrapper"] = True   # provenance: it came chatty
     t["markdown"] = new.strip()
     if ledger_key and ledger_path is not None:
         _append(ledger_path, {"key": ledger_key, "ts":

@@ -103,7 +103,8 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
               f"{stats.get('replaced', 0)} rearranged, "
               f"{stats.get('same', 0)} unchanged, "
               f"{stats.get('empty', 0)} no-answer, "
-              f"{stats.get('invalid', 0)} invalid (original kept)")
+              f"{stats.get('invalid', 0)} invalid (original kept), "
+              f"{stats.get('skip', 0)} skipped")
     anomalies = list(scan.anomalies) + list(extra_anoms)
     census = _census_summary(scan, anomalies)
 
@@ -220,11 +221,25 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
     llm_fn = verify_fn = refine_fn = None
     from . import llm as llm_mod
     if llm_mod.enabled():
+        # per-RUN, not per-process: the dashboard is long-lived, so
+        # otherwise run 2 would print no error lines and no samples
+        llm_mod.reset_error_reports()
+        from . import refine as refine_mod
+        refine_mod.reset_samples()
         llm_fn = llm_mod.transcriber(output_root / "llm_cache")
         verify_fn = llm_mod.verifier(output_root / "llm_cache")
         refine_fn = llm_mod.refiner(output_root / "llm_cache")
-        print(f"[{subject}] Gemini table pass enabled "
-              f"(model {os.environ.get('QBANK_LLM_MODEL', llm_mod.DEFAULT_MODEL)})")
+        model_id = os.environ.get("QBANK_LLM_MODEL", llm_mod.DEFAULT_MODEL)
+        print(f"[{subject}] Gemini table pass enabled (model {model_id})")
+        # Preflight ONE GET: is this key + this model id actually
+        # usable? Better to learn it now than from a whole run full of
+        # "no-answer" (QBANK_LLM_PREFLIGHT=0 skips the check).
+        if os.environ.get("QBANK_LLM_PREFLIGHT", "1") != "0" \
+                and not llm_mod.check_model(model_id):
+            print(f"[{subject}] *** Gemini model check FAILED — every call "
+                  f"will return nothing, tables raw rahengi. Sai model id "
+                  f"QBANK_LLM_MODEL me daalo (ya QBANK_LLM_TABLES=0 se "
+                  f"Gemini band kar do) ***")
     else:
         from . import keypool
         why = ("QBANK_LLM_TABLES=0" if keypool.discover_keys()

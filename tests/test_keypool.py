@@ -133,3 +133,151 @@ def test_enabled_follows_keypool_forms(monkeypatch):
     assert llm.enabled()
     monkeypatch.setenv("QBANK_LLM_TABLES", "0")
     assert not llm.enabled()
+
+
+# ---- per-minute pacing (15/min free-tier rate, safe boundary) ----------
+
+def test_minute_pacing_prefers_key_with_room():
+    """A pacing-capped key is skipped, NOT exhausted — the pool keeps
+    serving from the next key with room instead of waiting."""
+    pool = KeyPool(["k1", "k2"], max_calls_per_day=100,
+                   max_calls_per_minute=2)
+    assert pool.acquire() == "k1"
+    pool.note_call()
+    pool.note_call()                      # k1 spent its 2/min
+    assert pool.acquire() == "k2"         # room -> advance, no waiting
+    assert pool.st["key1"]["status"] == "active"
+
+
+def test_minute_pacing_waits_when_every_key_capped(monkeypatch, capsys):
+    """No key with room: the pool sleeps for the window instead of
+    tripping a 429 (fake clock, so no real 60 s wait)."""
+    now = [1000.0]
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    monkeypatch.setattr(keypool.time, "time", lambda: now[0])
+    monkeypatch.setattr(keypool.time, "sleep", fake_sleep)
+    pool = KeyPool(["k1"], max_calls_per_day=100, max_calls_per_minute=1)
+    assert pool.acquire() == "k1"
+    pool.note_call()                      # spends the 1/min at t=1000
+    assert pool.acquire() == "k1"         # waits for the window to slide
+    assert slept == [60.0]
+    assert "pacing cap" in capsys.readouterr().out
+
+
+# ---- key-fault rotation --------------------------------------------------
+
+def _http_err(code, body: bytes):
+    return urllib.error.HTTPError(
+        "http://x", code, "Bad", {}, io.BytesIO(body))
+
+
+def test_call_rotates_on_revoked_key(monkeypatch, capsys):
+    """One revoked key must not kill the run — the pool advances and
+    the next key serves."""
+    from qbank import llm
+    pool = KeyPool(["k1", "k2"], max_calls_per_day=100)
+    seen = []
+
+    def fake_post(url, payload, key):
+        seen.append(key)
+        if key == "k1":
+            raise _http_err(400, b'{"error":{"status":"INVALID_ARGUMENT",'
+                                 b'"message":"API key not valid. Pass a '
+                                 b'valid key."}}')
+        return _resp([["a"]])
+
+    monkeypatch.setattr(llm, "_post", fake_post)
+    assert llm._call(pool, "", "m", {}) == [["a"]]
+    assert seen == ["k1", "k2"]
+    assert pool.st["key1"]["status"] == "exhausted"
+    assert "advancing to the next key" in capsys.readouterr().out
+
+
+def test_call_rotates_on_quota_403(monkeypatch, capsys):
+    """Quota exhaustion arriving as 403 rotates exactly like a 429."""
+    from qbank import llm
+    pool = KeyPool(["k1", "k2"], max_calls_per_day=100)
+    seen = []
+
+    def fake_post(url, payload, key):
+        seen.append(key)
+        if key == "k1":
+            raise _http_err(403, b'{"error":{"status":"PERMISSION_DENIED",'
+                                 b'"message":"Quota exceeded for quota '
+                                 b'metric"}}')
+        return _resp([["a"]])
+
+    monkeypatch.setattr(llm, "_post", fake_post)
+    assert llm._call(pool, "", "m", {}) == [["a"]]
+    assert seen == ["k1", "k2"]
+    assert pool.st["key1"]["status"] == "exhausted"
+    assert "advancing to the next key" in capsys.readouterr().out
+
+
+def test_call_reports_pool_exhausted_not_network(monkeypatch, capsys):
+    """A spent pool must say so — the old generic handler blamed the
+    network for an empty pool."""
+    from qbank import llm
+
+    def boom(url, payload, key):
+        raise AssertionError("no HTTP attempt with a dead pool")
+
+    monkeypatch.setattr(llm, "_post", boom)
+    pool = KeyPool(["k1"], max_calls_per_day=0)
+    assert llm._call(pool, "", "m", {}) is None
+    out = capsys.readouterr().out
+    assert "pool exhausted" in out and "network unreachable" not in out
+    pool = KeyPool(["k1"], max_calls_per_day=0)
+    assert llm._call_text(pool, "", "m2", {}) is None
+    out = capsys.readouterr().out
+    assert "pool exhausted" in out and "network unreachable" not in out
+
+
+def test_call_does_not_burn_keys_on_404(monkeypatch, capsys):
+    """A wrong model id fails identically on every key — report once,
+    rotate never."""
+    from qbank import llm
+    pool = KeyPool(["k1", "k2"], max_calls_per_day=100)
+    calls = []
+
+    def fake_post(url, payload, key):
+        calls.append(key)
+        raise _http_err(404, b'{"error":{"status":"NOT_FOUND",'
+                             b'"message":"models/m is not found"}}')
+
+    monkeypatch.setattr(llm, "_post", fake_post)
+    assert llm._call(pool, "", "m", {}) is None
+    assert calls == ["k1"]
+    assert pool.st["key1"]["status"] == "active"
+    assert "QBANK_LLM_MODEL" in capsys.readouterr().out
+
+
+def test_throughput_scales_with_key_count(monkeypatch):
+    """Jitni keys, utna rate: 3 keys x 2/min serves 6 back-to-back
+    calls with ZERO waiting (one key's cap never blocks the pool
+    while a sister key has room); only the 7th call waits."""
+    now = [1000.0]
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    monkeypatch.setattr(keypool.time, "time", lambda: now[0])
+    monkeypatch.setattr(keypool.time, "sleep", fake_sleep)
+    pool = KeyPool(["k1", "k2", "k3"], max_calls_per_day=100,
+                   max_calls_per_minute=2)
+    used = []
+    for _ in range(6):
+        used.append(pool.acquire())
+        pool.note_call()
+    assert slept == []                        # 3 keys x 2/min, no wait
+    assert sorted(set(used)) == ["k1", "k2", "k3"]  # every key served
+    # 7th: all capped -> waits, then serves from the active pointer
+    assert pool.acquire() == "k3"
+    assert slept == [60.0]                    # then the window slides

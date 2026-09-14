@@ -235,6 +235,7 @@ def test_refine_runs_during_extraction(tmp_path, monkeypatch):
 
     from qbank import llm as llm_mod
     monkeypatch.setattr(llm_mod, "enabled", lambda: True)
+    monkeypatch.setattr(llm_mod, "check_model", lambda *a, **k: True)
     monkeypatch.setattr(llm_mod, "transcriber",
                         lambda cache_dir=None, **k:
                         lambda book, pg, box: None)
@@ -285,6 +286,7 @@ def test_run_log_shows_refine_stats(tmp_path, monkeypatch, capsys):
     _build_book(pdf)
     from qbank import llm as llm_mod
     monkeypatch.setattr(llm_mod, "enabled", lambda: True)
+    monkeypatch.setattr(llm_mod, "check_model", lambda *a, **k: True)
     monkeypatch.setattr(llm_mod, "transcriber",
                         lambda cache_dir=None, **k:
                         lambda book, pg, box: None)
