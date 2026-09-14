@@ -904,3 +904,266 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
             cache.write_text(json.dumps(txt))
         return txt
     return refine
+
+# =====================================================================
+# FINAL table refinement — visual + structured, fidelity-gated.
+#
+# Unlike the text-only rearrange pass above (which ships whatever
+# table-shaped answer it is given), this is the LAST table stage and
+# runs under a HARD deterministic fidelity envelope (see
+# qbank.refine_final.fidelity_compare): the model returns structured
+# JSON {action, refined_table, changes} over the rendered crop +
+# current pipe-markdown, and the refined table is SAVED only when the
+# validator proves rows x columns unchanged and every cell
+# character-identical after whitespace/<br>/bullet normalisation (or a
+# number restored with source page-text evidence). Anything else is
+# rejected or routed to the human review queue.
+# =====================================================================
+
+REFINE_FINAL_PROMPT = """You are the final table-refinement engine for a premium
+medical study app. You receive ONE table as (a) the rendered crop of
+the table exactly as printed in the source PDF and (b) the current
+pipe-markdown extraction, plus metadata. The printed crop is the
+AUTHORITY for cell boundaries, characters, numbers, symbols and
+structure; the extraction is the starting point.
+
+Do PRESENTATION REFINEMENT + EXTRACTION-ERROR REPAIR. Nothing else.
+
+ALLOWED presentation changes (same information, better layout):
+- compact, highly scannable, visually balanced cells; free from
+  unnecessary blank space and ugly line wrapping
+- break long cell content into logical lines using <br>
+- convert naturally list-like content inside a cell into bullets
+  ("• item<br>• item")
+- remove accidental excessive whitespace; fix punctuation spacing
+  (no space before . , ; : ! ? ), keep meaningful paragraph breaks
+- make the header row visually clear; keep related information
+  together; never make the table so compact that readability suffers
+
+ALLOWED content repairs (ONLY genuine extraction corruption):
+- words broken by line wrapping ("layere d" -> "layered",
+  "osteocal cin" -> "osteocalcin", "A rch" -> "Arch")
+- words glued together / missing spaces ("retractionnot" ->
+  "retraction not", "follow ing:" -> "following:")
+- incorrect spaces around punctuation; obvious character/clipping/
+  OCR artefacts visible in the crop
+- broken units/numbers ONLY where the crop clearly prints the
+  corrected form ("50 – 300" -> "50–300")
+Medical knowledge may be used ONLY as a secondary verification signal
+for recognising such obvious corruption. It is NOT a licence to
+rewrite source content.
+
+HARD RULES (any violation makes the whole answer useless):
+- EXACTLY the same rows and the same columns as the extraction; cell
+  (r,c) maps 1:1 to (r,c). Never split one logical cell into several
+  cells, never merge separate source cells.
+- Do NOT add explanations, facts, examples, drugs, doses,
+  indications or contraindications; do NOT summarize or paraphrase;
+  do NOT invent missing cells; do NOT expand abbreviations
+  unnecessarily; do NOT change a number or unit without clear source
+  evidence; do NOT change the meaning of any statement.
+- For a cross-page continuation: ONE logical table, row order and
+  column structure preserved, no repeated-header re-addition, no
+  duplicated content.
+
+Return ONLY valid JSON (no markdown fences, no prose):
+{
+  "table_id": "<table id from the metadata>",
+  "action": "NO_CHANGE" | "REFINED" | "REVIEW",
+  "refined_table": "<the full pipe-markdown table>",
+  "changes": [
+    {"cell": "R3C2", "before": "<exact current cell text>",
+     "after": "<new cell text>", "reason": "<short reason>",
+     "confidence": 0.0, "evidence": "visual" | "visual+medical"
+       | "medical" | "presentation"}
+  ]
+}
+- "action": "NO_CHANGE" when no genuine improvement is needed.
+  Do NOT force a change.
+- "action": "REFINED" when you return an improved table.
+- "action": "REVIEW" when a possible corruption is ambiguous (two
+  medically plausible readings) — a human must decide.
+- "changes" lists EVERY cell you altered. "before" must be the exact
+  current cell text. confidence is your 0..1 certainty.
+- evidence: "visual" = the crop clearly shows it (auto-accept class);
+  "visual+medical" = crop shows it and it is a known medical term;
+  "medical" = only medical knowledge suggests it (will be routed to
+  human review); "presentation" = layout/formatting only."""
+
+
+def _call_structured(pool, key: str, model: str, payload: dict,
+                     counter: dict | None = None):
+    """generateContent exchange expecting a JSON OBJECT answer
+    ({action, refined_table, changes, table_id}), with the same
+    pool/retry discipline as _call. Returns the parsed dict, or None
+    — the caller keeps the current table. `counter` (a dict with an
+    "n" key) is bumped once per model query actually issued."""
+    rot, attempt = 0, 0
+    counted = False
+    while attempt < 3:
+        try:
+            k = pool.acquire() if pool is not None else key
+            resp = _post(API.format(model=model), payload, k)
+            if pool is not None:
+                pool.note_call()
+            if counter is not None and not counted:
+                counter["n"] = int(counter.get("n", 0)) + 1
+                counted = True
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:              # noqa: BLE001
+                body = ""
+            if pool is not None and e.code == 429 and rot < len(pool.keys):
+                pool.note_429(body)
+                rot += 1
+                continue
+            if pool is not None and rot < len(pool.keys) \
+                    and _key_fault(e.code, body):
+                pool.note_bad_key(e.code, body)
+                rot += 1
+                continue
+            report_error(f"{model} call failed",
+                         _http_detail_text(e.code, body), _hint_for(e.code))
+            return None
+        except keypool.PoolExhausted as e:
+            report_error(f"{model} pool exhausted", str(e),
+                         "no usable key left — current table kept")
+            return None
+        except Exception as e:                 # noqa: BLE001
+            report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
+                         "network unreachable from this host?")
+            return None
+        txt, why = _answer_text(resp)
+        if txt:
+            txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
+            try:
+                obj = json.loads(txt)
+                if isinstance(obj, dict):
+                    return obj
+                why = "answer JSON was not an object"
+            except ValueError:
+                why = "answer was not valid JSON"
+        report_error(f"{model} no usable answer", why)
+        if "MAX_TOKENS" in why:
+            payload = _bump_cap(payload)       # retry with more room
+        attempt += 1
+    return None
+
+
+# how many page crops ride along with one refinement call (a
+# cross-page table renders one crop per contributing page)
+MAX_REFINE_CROPS = 3
+
+
+def refine_final(cache_dir: Path | None = None, model: str | None = None,
+                 key: str | None = None, pool=None,
+                 counter: dict | None = None):
+    """Return refine(book, regions, t, md, context) -> dict | None.
+
+    The FINAL table stage's model call: sends the rendered crop(s) of
+    the printed table region (authority) plus the current
+    pipe-markdown (starting point) plus metadata and optional
+    surrounding text; expects the structured JSON described in
+    REFINE_FINAL_PROMPT. `regions` is [(page, box), ...] in reading
+    order; book=None or empty regions -> text-only (conservative)
+    mode. Cached per (model, prompt, doc, regions, markdown);
+    `counter["n"]` counts model queries actually issued (for the
+    audit's Gemini-API-call tally)."""
+    pool = pool or (None if key else keypool.get_pool())
+    key = key or os.environ.get("GEMINI_API_KEY", "")
+    model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
+
+    def refine(book, regions, t: dict, current_md: str,
+               context: str | None = None):
+        from .refine import salvage_table, valid_rearrangement
+        regions = [(int(p), tuple(b)) for p, b in (regions or [])]
+        pgs = [p for p, _ in regions] or [1]
+        meta = {
+            "table_id": t.get("table_id"),
+            "source_pages": t.get("source_pages") or pgs,
+            "cross_page": bool(t.get("merged_continuation")),
+            "header_deduplicated": bool(t.get("header_deduplicated")),
+        }
+        has_image = book is not None and bool(regions)
+        cache = None
+        if cache_dir is not None:
+            # model + prompt + document + regions + content identity
+            reg_key = tuple(str(p) + "|" + str(tuple(round(v, 1) for v in b))
+                            for p, b in regions)
+            doc_name = str(
+                getattr(getattr(book, 'doc', None), 'name', ''))
+            md_hash = hashlib.sha1(
+                (current_md or '').encode()).hexdigest()
+            sig = hashlib.sha1(
+                ("TF1|" + model + "|" + _fp8(REFINE_FINAL_PROMPT) + "|"
+                 + doc_name + "|" + str(tuple(pgs)) + "|"
+                 + str(reg_key) + "|" + md_hash).encode()).hexdigest()
+            cache = cache_dir / f"{sig}.json"
+            if cache.exists():
+                try:
+                    return json.loads(cache.read_text())
+                except Exception:              # noqa: BLE001
+                    pass
+        ask = REFINE_FINAL_PROMPT
+        if has_image:
+            n = min(len(regions), MAX_REFINE_CROPS)
+            ask += (f"\n\nThe {n} image{'s' if n > 1 else ''} show "
+                    "the table exactly as printed in the source PDF "
+                    "(one crop per contributing page, reading order) — "
+                    "they are the authority for boundaries, "
+                    "characters, numbers and symbols.")
+        else:
+            ask += ("\n\nNo page image is available for this table. "
+                    "Work from the extraction text alone and stay "
+                    "conservative: prefer NO_CHANGE unless a repair "
+                    "is text-obvious.")
+        if meta.get("cross_page"):
+            ask += ("\n\nThis table continued across several printed "
+                    "pages; the extraction below is the MERGED "
+                    "continuation (repeated headers already "
+                    "deduplicated). Treat it as ONE logical table — "
+                    "keep row order and column structure, do not "
+                    "re-add headers, do not duplicate content.")
+        ask += "\n\nMetadata:\n" + json.dumps(meta, ensure_ascii=False)
+        if context:
+            ask += ("\n\nSurrounding text (context for what this table "
+                    "describes; NEVER a source for table content):\n"
+                    + context)
+        ask += "\n\nCurrent extraction (pipe-markdown):\n" + current_md
+        parts = []
+        if has_image:
+            for pg, box in regions[:MAX_REFINE_CROPS]:
+                try:
+                    pix = book.doc[pg - 1].get_pixmap(
+                        clip=pymupdf.Rect(*box), matrix=pymupdf.Matrix(3, 3))
+                    b64 = base64.b64encode(pix.tobytes("png")).decode()
+                    parts.append({"inline_data":
+                                  {"mime_type": "image/png", "data": b64}})
+                except Exception as e:         # noqa: BLE001
+                    report_error(
+                        "table crop could not be rendered for Gemini",
+                        f"{type(e).__name__}: {e}")
+        parts.append({"text": ask})
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.0,
+                                 "max_output_tokens": _max_tokens(16384)},
+        }
+        try:
+            ans = _call_structured(pool, key, model, payload, counter)
+        except Exception:                      # noqa: BLE001
+            ans = None
+        if ans is not None:
+            rt = ans.get("refined_table")
+            if isinstance(rt, str) and rt.strip() \
+                    and not valid_rearrangement(rt):
+                block = salvage_table(rt)
+                if block is not None:
+                    ans = {**ans, "refined_table": block,
+                           "salvaged_from_wrapper": True}
+        if cache is not None and ans is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(ans, ensure_ascii=False))
+        return ans
+    return refine

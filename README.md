@@ -203,7 +203,57 @@ dashboard binds it and Railway exposes the public URL automatically.
    two candidate tables are still refused — arrangement is the model's
    job, guessing is not. Run `python scripts/check_gemini.py` for the
    full verdict (keys → model → a real call → validator) in one shot.
-8. **Gate** (`qbank/export.py`) — the zip builds as soon as every
+8. **Final table refinement** (`qbank/refine_final.py`) — after
+   extraction and the rearrangement pass, every logical table gets a
+   deterministic PRE-CHECK first: QA-flagged fragments, long cells,
+   list-like cells, `50 – 300`-style range spacing and lost-space
+   artefacts. A table that trips none of them is clean — it is kept
+   as-is and NEVER sent to Gemini (cost control). A table that trips
+   one is rendered as page crops (3× zoom PNG of each source region —
+   the source visual is the AUTHORITY) and sent with the current
+   pipe-markdown, its metadata and up to 300 chars of surrounding
+   text. The model returns one JSON per table:
+   `NO_CHANGE` | `REFINED` | `REVIEW` plus a
+   `changes[{cell, before, after, reason, confidence, evidence}]`
+   list. It may repair genuine extraction damage (split/glued words,
+   punctuation spacing, clipping artefacts, obvious medical spelling
+   corruption, numbers/units that contradict the crop) and improve
+   presentation (`<br>` breaks, bullets inside cells, compact
+   spacing) — but must not add, summarise, or rewrite content, and
+   medical knowledge is a validation signal, NOT a licence: a repair
+   that rests on medical knowledge alone is routed to human REVIEW.
+   The model's answer is then judged by a deterministic FIDELITY
+   VALIDATOR: every cell pair must be character-identical after
+   whitespace (and bullet/`<br>`/list-separator) normalisation —
+   added characters are hallucinations, removed characters deletions,
+   swapped characters substitutions, changed numbers are rejected
+   UNLESS the source page's own text carries the new digits; any
+   row/column count change is a structural change. Each repair is
+   classified — presentation / spacing / word-restore /
+   number-repair — and content-level repairs must carry model
+   evidence + confidence ≥ 0.5 or they go to REVIEW. The accepted
+   markdown ships with the original preserved under
+   `validation.pre_final_markdown`; the per-table verdict + the model's
+   change list land in `validation.final_refine` and one JSONL row per
+   table in `<output>/data/table_refinement.jsonl` (the source of
+   truth, deduped by subject|question|table id). Nothing the stage
+   does may touch questions, answers, solutions, images, or the table
+   count/ids/source pages — a before/after snapshot of every record
+   is verified per chapter and the result is printed. The whole stage
+   is on by default, gated by the pre-check: `QBANK_FINAL_REFINE=
+   flagged` narrows it to QA-flagged tables, `=off` disables it.
+   Responses are cached under `<output>/llm_cache/` like the other
+   passes. Per-book audit in
+   `<output>/data/table_refinement_audit.json` (totals, repair
+   classes, fidelity violations, rejected hallucinations/deletions/
+   number changes, Gemini API calls, regression result, and every
+   accepted content correction with cell/before/after/reason/
+   evidence/confidence) — print it with
+   `python -m qbank table-audit --book ENT`. The stage creates no
+   table images and no new assets: refined tables stay structured
+   markdown, and the pre-existing per-page table renders are
+   untouched.
+9. **Gate** (`qbank/export.py`) — the zip builds as soon as every
    chapter is on disk and the book's REVIEW tables are all decided;
    census failures / unresolved q_ids ship as receipt advisories.
 
@@ -316,6 +366,9 @@ deterministic and receipts say `llm_tables_repaired: 0` honestly.
 for rearranging, doubled automatically when an answer hits the cap);
 `QBANK_LLM_TABLES=0` switches the whole Gemini pass off;
 `QBANK_REFINE=flagged|off` narrows/disables the rearrangement;
+`QBANK_FINAL_REFINE=all|flagged|off` controls the FINAL table
+refinement stage (default `all` — every table is still pre-checked
+deterministically first, so clean tables never cost an API call);
 `QBANK_LLM_PREFLIGHT=0` skips the startup model check;
 `QBANK_MAX_CALLS_PER_DAY` caps calls per key (pool state in
 `<output>/data/keypool_state.json`); `QBANK_MAX_CALLS_PER_MINUTE`
