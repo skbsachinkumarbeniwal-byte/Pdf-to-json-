@@ -255,3 +255,29 @@ def test_call_does_not_burn_keys_on_404(monkeypatch, capsys):
     assert calls == ["k1"]
     assert pool.st["key1"]["status"] == "active"
     assert "QBANK_LLM_MODEL" in capsys.readouterr().out
+
+
+def test_throughput_scales_with_key_count(monkeypatch):
+    """Jitni keys, utna rate: 3 keys x 2/min serves 6 back-to-back
+    calls with ZERO waiting (one key's cap never blocks the pool
+    while a sister key has room); only the 7th call waits."""
+    now = [1000.0]
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    monkeypatch.setattr(keypool.time, "time", lambda: now[0])
+    monkeypatch.setattr(keypool.time, "sleep", fake_sleep)
+    pool = KeyPool(["k1", "k2", "k3"], max_calls_per_day=100,
+                   max_calls_per_minute=2)
+    used = []
+    for _ in range(6):
+        used.append(pool.acquire())
+        pool.note_call()
+    assert slept == []                        # 3 keys x 2/min, no wait
+    assert sorted(set(used)) == ["k1", "k2", "k3"]  # every key served
+    # 7th: all capped -> waits, then serves from the active pointer
+    assert pool.acquire() == "k3"
+    assert slept == [60.0]                    # then the window slides

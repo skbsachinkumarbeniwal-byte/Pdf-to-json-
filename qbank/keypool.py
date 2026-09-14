@@ -245,5 +245,7 @@ def get_pool(output_root=None, env=None) -> KeyPool | None:
                             max_calls_per_minute=minute)
             print(f"[keypool] {len(keys)} key(s) in pool "
                   f"(fps: {', '.join(v['fp'] for v in _POOL.st.values())}); "
-                  f"pacing {minute}/min/key, cap {day}/day/key")
+                  f"pacing {minute}/min/key x {len(keys)} keys = "
+                  f"{minute * len(keys)}/min effective, "
+                  f"cap {day}/day/key")
     return _POOL
