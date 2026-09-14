@@ -193,11 +193,23 @@ def build_rows(records: dict, subject: str, chapter_id: str, chapter_no: int,
     return q_rows, a_rows, s_rows, un_rows
 
 
+def _with_final_refine(table_stats: dict | None,
+                       final_refine_stats: dict | None) -> dict:
+    """Per-chapter table stats + the final-refinement pass's own audit
+    (accepted/rejected/review counts and the before/after regression
+    verdict), nested under tables.final_refine."""
+    out = dict(table_stats or {})
+    if final_refine_stats is not None:
+        out["final_refine"] = final_refine_stats
+    return out
+
+
 def write_chapter_split(*, output_root: Path, subject: str, chapter_id: str,
                         chapter_no: int, q_rows, a_rows, s_rows, un_rows,
                         orphan_rows, manifest_rows, scan_summary: dict,
                         glyph_audit: dict, image_report_summary: dict,
-                        table_stats: dict | None = None) -> dict:
+                        table_stats: dict | None = None,
+                        final_refine_stats: dict | None = None) -> dict:
     ch_dir = Path(output_root) / "split" / subject / chapter_id
     ch_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_jsonl(ch_dir / "questions.jsonl", q_rows)
@@ -249,7 +261,7 @@ def write_chapter_split(*, output_root: Path, subject: str, chapter_id: str,
         "census": scan_summary,
         "glyph_fix_counts": glyph_audit,
         "images": image_report_summary,
-        "tables": table_stats or {},
+        "tables": _with_final_refine(table_stats, final_refine_stats),
         "phase2_pending_anchors": {},
     }
     _atomic_write_json(ch_dir / "chapter_completeness.json", completeness)

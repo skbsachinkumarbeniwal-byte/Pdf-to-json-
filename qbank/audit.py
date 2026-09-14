@@ -32,7 +32,7 @@ from pathlib import Path
 _NUM_RE = re.compile(r"\d[\d,\.]*")
 
 
-def _nums(text: str) -> set:
+def num_tokens(text: str) -> set:
     """Numeric tokens, normalised (comma grouping stripped, trailing
     separators dropped): '1,000' == '1000', '5.' == '5'."""
     out = set()
@@ -83,6 +83,13 @@ def _load_page_text(output_root: Path) -> dict | None:
     return out
 
 
+def load_page_text(output_root: Path) -> dict | None:
+    """Public view of the run's page-text evidence dump (page -> raw
+    text layer). None when the dump is absent — callers must then
+    treat page-text evidence as unavailable, never as empty."""
+    return _load_page_text(Path(output_root))
+
+
 def audit_book(output_root: Path, subject: str | None = None) -> dict:
     """Scan one subject's split tree (subject=None => all subjects).
     Returns {"flags": [...], "by_kind": {...}, "rows_scanned": n,
@@ -118,8 +125,8 @@ def audit_book(output_root: Path, subject: str | None = None) -> dict:
                         return
                     ev = set()
                     for p in pages:
-                        ev |= _nums(page_text.get(p, ""))
-                    for v in sorted(_nums(text) - ev):
+                        ev |= num_tokens(page_text.get(p, ""))
+                    for v in sorted(num_tokens(text) - ev):
                         flags.append({
                             "kind": "numeric_drift", "severity": "REVIEW",
                             "subject": subj_dir.name,
@@ -140,8 +147,8 @@ def audit_book(output_root: Path, subject: str | None = None) -> dict:
                     if page_text is not None:
                         ev = set()
                         for p in sp:
-                            ev |= _nums(page_text.get(p, ""))
-                        for v in sorted(_nums(sol.get("solution_text", "")) - ev):
+                            ev |= num_tokens(page_text.get(p, ""))
+                        for v in sorted(num_tokens(sol.get("solution_text", "")) - ev):
                             flags.append({
                                 "kind": "numeric_drift", "severity": "REVIEW",
                                 "subject": subj_dir.name,

@@ -71,7 +71,7 @@ def _manifest_and_files(claims, subject: str, chapter_no: int):
 
 def run_chapter(book: Book, subject: str, ch, store: ImageStore,
                 output_root, vocab=None, llm=None, verify=None,
-                refine=None) -> dict:
+                refine=None, final_refine=None) -> dict:
     chapter_id = f"{subject}-{ch.chapter_no:03d}"
     t0 = time.time()
     scan = scan_chapter(book, ch.file_start, ch.file_end)
@@ -105,6 +105,55 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
               f"{stats.get('empty', 0)} no-answer, "
               f"{stats.get('invalid', 0)} invalid (original kept), "
               f"{stats.get('skip', 0)} skipped")
+    # FINAL table refinement (presentation + medically safe repair):
+    # `all` (default) sends EVERY table, `flagged` only QA-flagged
+    # tables; every answer is judged by the deterministic fidelity
+    # validator (accept / review / reject) — the pre-check's reasons
+    # are still recorded on the ledger row, the safety is unchanged.
+    # QBANK_FINAL_REFINE=all | flagged | off
+    final_only = os.environ.get("QBANK_FINAL_REFINE", "all")
+    final_stats: dict = {}
+    final_regression = None
+    if final_refine and final_only != "off":
+        from . import refine_final as final_mod
+        fledger = Path(output_root) / "data" / final_mod.LEDGER
+        fmemo: dict = {}
+        page_text = final_mod.load_page_text(output_root)
+        changed_ids: set = set()
+        pre_snap = final_mod.snapshot_records(records)
+        for qn, rec in records.items():
+            qid = f"{subject}-{ch.chapter_no:03d}-{qn:03d}"
+            regs = list(table_regions.get((qn, "Q")) or []) + \
+                list(table_regions.get((qn, "SOL")) or [])
+            for t in rec.get("tables") or []:
+                tid = t.get("table_id")
+                regions = [(int(p), tuple(bx))
+                           for (p, bx, t2) in regs if t2 == tid]
+                context = ((rec.get("question_text") or
+                            rec.get("solution_text") or "")[:300])
+                st = final_mod.final_refine_table(
+                    t, book, final_refine, only=final_only, memo=fmemo,
+                    page_text=page_text, vocab=vocab,
+                    ledger_key=f"{subject}|{qid}|{tid}",
+                    ledger_path=fledger, regions=regions,
+                    context=context)
+                final_stats[st] = final_stats.get(st, 0) + 1
+                if st == "accepted":
+                    changed_ids.add(tid)
+        post_snap = final_mod.snapshot_records(records)
+        final_regression = final_mod.verify_regression(
+            pre_snap, post_snap, changed_ids)
+        reg = "OK" if final_regression["ok"] else \
+            "FAILED: " + "; ".join(final_regression["problems"][:3])
+        print(f"[{subject}] {chapter_id}: final table refinement — "
+              f"{final_stats.get('accepted', 0)} refined, "
+              f"{final_stats.get('no_change', 0)} no-change, "
+              f"{final_stats.get('skip', 0)} skipped, "
+              f"{final_stats.get('rejected', 0)} rejected, "
+              f"{final_stats.get('review', 0)} review, "
+              f"{final_stats.get('empty', 0)} no-answer, "
+              f"{final_stats.get('invalid', 0)} invalid | regression "
+              f"{reg}")
     anomalies = list(scan.anomalies) + list(extra_anoms)
     census = _census_summary(scan, anomalies)
 
@@ -136,6 +185,10 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         s_rows=s_rows, un_rows=un_rows, orphan_rows=orphan_rows,
         manifest_rows=manifest, scan_summary=census,
         glyph_audit=dict(glyph_audit), table_stats=table_stats,
+        final_refine_stats=(
+            {**final_stats,
+             "regression_ok": final_regression["ok"]}
+            if final_regression is not None else None),
         image_report_summary={
             "claimed": len(img_rep.claims),
             "orphans": len(img_rep.orphans),
@@ -179,6 +232,10 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         "glyph_fixes": sum(glyph_audit.values()),
         "images": len(img_rep.claims), "orphans": len(img_rep.orphans),
         "secs": round(dt, 1),
+        "final_refine": ({**final_stats,
+                          "regression_ok": final_regression["ok"],
+                          "counts": final_regression["counts"]}
+                         if final_regression is not None else {}),
     }
 
 
@@ -218,17 +275,22 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
     from .tables import build_vocab
     vocab = build_vocab(book)   # book-wide evidence for space repairs
     book.drop_cache()           # vocab pass touched every page: free it
-    llm_fn = verify_fn = refine_fn = None
+    llm_fn = verify_fn = refine_fn = final_fn = None
+    fcalls = {"n": 0}           # final-stage Gemini queries actually issued
     from . import llm as llm_mod
     if llm_mod.enabled():
         # per-RUN, not per-process: the dashboard is long-lived, so
         # otherwise run 2 would print no error lines and no samples
         llm_mod.reset_error_reports()
         from . import refine as refine_mod
+        from . import refine_final as refine_final_mod
         refine_mod.reset_samples()
+        refine_final_mod.reset_samples()
         llm_fn = llm_mod.transcriber(output_root / "llm_cache")
         verify_fn = llm_mod.verifier(output_root / "llm_cache")
         refine_fn = llm_mod.refiner(output_root / "llm_cache")
+        final_fn = llm_mod.refine_final(output_root / "llm_cache",
+                                        counter=fcalls)
         model_id = os.environ.get("QBANK_LLM_MODEL", llm_mod.DEFAULT_MODEL)
         print(f"[{subject}] Gemini table pass enabled (model {model_id})")
         # Preflight ONE GET: is this key + this model id actually
@@ -268,7 +330,7 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
             print(f"[{subject}] {chapter_id}: already done (resume)")
             continue
         res = run_chapter(book, subject, ch, store, output_root, vocab,
-                          llm_fn, verify_fn, refine_fn)
+                          llm_fn, verify_fn, refine_fn, final_fn)
         results.append(res)
         for c in chapters_out:
             if c["chapter_id"] == chapter_id:
@@ -288,6 +350,20 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
     write_chapters_json(config.SUBJECTS_DIR / subject / "chapters.json",
                         [c for c in chapters_out if c["subject"] == subject])
     book.close()
+
+    # book-level table-refinement audit report (the final stage's
+    # ledger + per-chapter before/after regression results)
+    from . import refine_final as refine_final_mod
+    audit = refine_final_mod.write_audit(
+        output_root, subject, api_calls=fcalls["n"],
+        regression=[r.get("final_refine") for r in results])
+    print(f"[{subject}] final table refinement audit: "
+          f"{audit['tables_refined']} refined, "
+          f"{audit['tables_unchanged']} unchanged, "
+          f"{audit['tables_rejected']} rejected, "
+          f"{audit['tables_review']} review, "
+          f"{audit['gemini_api_calls']} Gemini calls | "
+          f"data/{refine_final_mod.AUDIT}")
 
     bad = [r["chapter_id"] for r in results if not r["census_ok"]]
     return {"results": results, "chapters_run": len(results),

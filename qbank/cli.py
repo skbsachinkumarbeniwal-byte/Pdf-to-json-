@@ -6,6 +6,7 @@ Command line:
     python3 -m qbank export [--dest path.zip]
     python3 -m qbank status
     python3 -m qbank audit [--book BIO]
+    python3 -m qbank table-audit --book BIO
     python3 -m qbank keys
 
 Extraction is deterministic and needs no API key; the optional Gemini
@@ -118,6 +119,43 @@ def cmd_keys(args) -> int:
     return 0
 
 
+def cmd_table_audit(args) -> int:
+    """Print the final table-refinement audit report for one book."""
+    from . import refine_final as final_mod
+    res = final_mod.load_audit(config.OUTPUT_ROOT, args.book)
+    if not res:
+        print(f"no table-refinement audit for {args.book} — the final "
+              "stage runs when Gemini is enabled (data/"
+              f"{final_mod.AUDIT})")
+        return 1
+    for k in ("total_tables", "tables_unchanged", "tables_refined",
+              "tables_rejected", "tables_review", "tables_no_answer",
+              "spacing_repairs", "medical_spelling_repairs",
+              "number_repairs", "structural_repairs",
+              "structural_rejections", "presentation_only_refinements",
+              "cross_page_tables_checked", "fidelity_violations",
+              "rejected_hallucinations", "rejected_deletions",
+              "rejected_number_changes", "render_page_waste_issues",
+              "gemini_api_calls"):
+        print(f"  {k}: {res.get(k)}")
+    reg = res.get("before_after_regression") or {}
+    print(f"  before_after_regression: "
+          f"{'OK' if reg.get('ok') else 'FAILED'} "
+          f"({reg.get('chapters', 0)} chapter(s), {reg.get('counts', {})})")
+    corr = res.get("corrections") or []
+    if corr:
+        print(f"  accepted content corrections ({len(corr)}):")
+        for c in corr[: args.limit]:
+            print(f"    {c['table_id']} {c['cell']}: "
+                  f"{c.get('before')!r} -> {c.get('after')!r} "
+                  f"[{c.get('kind')}] evidence={c.get('evidence')} "
+                  f"confidence={c.get('confidence')} "
+                  f"reason={c.get('reason')!r}")
+        if len(corr) > args.limit:
+            print(f"    ... and {len(corr) - args.limit} more")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="qbank", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -151,8 +189,17 @@ def main(argv=None) -> int:
     p_au.set_defaults(fn=cmd_audit)
 
     p_keys = sub.add_parser("keys", help="Gemini key-pool status "
-                                         "(fingerprints only)")
+                                          "(fingerprints only)")
     p_keys.set_defaults(fn=cmd_keys)
+
+    p_ta = sub.add_parser("table-audit",
+                          help="final table-refinement audit report "
+                               "(counts + accepted content corrections)")
+    p_ta.add_argument("--book", required=True,
+                      help="subject code (e.g. ENT)")
+    p_ta.add_argument("--limit", type=int, default=40,
+                      help="max corrections to print (default 40)")
+    p_ta.set_defaults(fn=cmd_table_audit)
 
     args = ap.parse_args(argv)
     return args.fn(args)

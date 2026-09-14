@@ -152,7 +152,23 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
 
     from . import review
     from . import refine as refine_mod
+    from . import refine_final as refine_final_mod
     census_bad, unresolved = _chapter_advisories(out_root, subject)
+    taudit = refine_final_mod.load_audit(out_root, subject)
+    table_refinement = None
+    if taudit:
+        table_refinement = {
+            k: taudit.get(k) for k in (
+                "total_tables", "tables_unchanged", "tables_refined",
+                "tables_rejected", "tables_review",
+                "spacing_repairs", "medical_spelling_repairs",
+                "number_repairs", "presentation_only_refinements",
+                "cross_page_tables_checked", "fidelity_violations",
+                "rejected_hallucinations", "rejected_deletions",
+                "rejected_number_changes", "render_page_waste_issues",
+                "gemini_api_calls")}
+        table_refinement["before_after_regression_ok"] = \
+            (taudit.get("before_after_regression") or {}).get("ok")
     receipt = {
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "output_root": out_root.name,
@@ -162,6 +178,7 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
         "review_decisions": len(review.load_decisions(out_root)),
         "human_edits": review.edit_count(out_root),
         "tables_refined": refine_mod.refined_count(out_root, subject),
+        "table_refinement": table_refinement,
         "census_failed_chapters": census_bad,
         "unresolved_qids": unresolved,
         "shipped_qa_status_counts": shipped_status or None,
