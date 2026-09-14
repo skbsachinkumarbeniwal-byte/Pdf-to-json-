@@ -192,13 +192,13 @@ def test_long_cell_formatting(tmp_path):
                  + " ".join(words[cut1:cut2]) + "<br>"
                  + " ".join(words[cut2:])]])
     before = md([["Mechanism"], [long_text]])
-    # the pre-check itself flags a long cell (no Gemini flag needed)
+    # the pre-check flags a long cell (recorded on the ledger row)
     t0 = table(before)
     assert "long_cell" in F.precheck(t0, VOCAB)
     st, t, rows, calls = run_stage(t0, refined(md_text=after), tmp_path,
                                    vocab=VOCAB)
     assert st == "accepted"
-    assert len(calls) == 1                    # pre-check gated the call
+    assert len(calls) == 1                    # all mode: the table is sent
     assert t["validation"]["final_refine"]["changes"][0]["kind"] \
         == "presentation"
     assert rows[0]["precheck"] == ["long_cell"]
@@ -290,21 +290,27 @@ def test_multi_column_table_cell_mapping(tmp_path):
 
 
 # --------------------------------------------------------------- 10
-def test_perfect_table_never_reaches_gemini(tmp_path):
+def test_all_mode_sends_every_table(tmp_path):
+    """QBANK_FINAL_REFINE=all (the default): even a table the
+    pre-check finds completely clean is sent to Gemini. If the model
+    finds nothing to fix it answers NO_CHANGE and the table ships
+    byte-identical — the pre-check no longer gates the call, the
+    safety still comes from the fidelity validator."""
     before = md([["Type", "Function", "Site"],
                  ["Kinase", "adds phosphate", "cytosol"],
                  ["Lipase", "cleaves ester", "gut"]])
-    t = table(before)
-    assert F.precheck(t, VOCAB) == []         # deterministic: clean
-    st, t2, rows, calls = run_stage(t, refined(md_text=before), tmp_path,
+    t = table(before)                         # unflagged, pre-check clean
+    assert F.precheck(t, VOCAB) == []         # the check still runs...
+    st, t2, rows, calls = run_stage(t, refined(action="NO_CHANGE",
+                                               md_text=before), tmp_path,
                                     vocab=VOCAB)
-    assert st == "skip"
-    assert calls == []                        # NO Gemini call, no cost
-    assert t2["markdown"] == before
-    assert rows[0]["status"] == "skip"
-    assert rows[0]["gemini_call"] is False
-    # and the ledger row still exists (the report counts it as
-    # unchanged, not as a mystery)
+    assert st == "no_change"
+    assert len(calls) == 1                    # ...but the table is sent
+    assert t2["markdown"] == before           # nothing was changed
+    assert "final_refine" not in t2["validation"]
+    assert rows[0]["status"] == "no_change"
+    assert rows[0]["gemini_call"] is True
+    assert rows[0]["precheck"] == []
 
 
 # --------------------------------------------------------------- 11
@@ -467,16 +473,12 @@ def _refine_stub(accepted):
     return factory
 
 
-def _force_precheck(monkeypatch):
-    monkeypatch.setattr(F, "precheck",
-                        lambda t, vocab=None: ["forced_e2e"])
-
-
 def test_refinement_creates_no_table_image(tmp_path, monkeypatch):
     """Running the final stage (with an accepted refinement) must leave
     the asset tree and image manifest byte-identical to a run without
-    it: no table image, no duplicate asset, no manifest row."""
-    _force_precheck(monkeypatch)
+    it: no table image, no duplicate asset, no manifest row. The
+    mini-book's table is pre-check CLEAN, so this also proves that
+    `all` mode sends even a clean table for refinement."""
     res_off, out_off = _run_mini(
         tmp_path, "out_off", False, _refine_stub(False), monkeypatch)
     # same run WITH the stage: force the model, accept one refinement
@@ -529,7 +531,6 @@ def test_full_pipeline_regression_no_unrelated_change(tmp_path,
     final stage on (one accepted refinement) every count, id, page
     list, question text, option, answer and solution is identical to
     a run without it — only the refined table's markdown differs."""
-    _force_precheck(monkeypatch)
     res_off, out_off = _run_mini(tmp_path, "rg_off", False,
                                  _refine_stub(False), monkeypatch)
     res_on, out_on = _run_mini(tmp_path, "rg_on", True,
@@ -594,14 +595,18 @@ def test_audit_report_fields_and_cli(tmp_path, capsys, monkeypatch):
                              ledger_name="data/" + ledger_name,
                              key="SUB|q|T2")
     assert st2 == "rejected"
-    t3 = table(before, table_id="T3")           # clean -> skip
-    run_stage(t3, None, tmp_path, vocab=VOCAB,
-              ledger_name="data/" + ledger_name, key="SUB|q|T3")
+    t3 = table(before, table_id="T3")           # clean, unflagged
+    st3, _, _, _ = run_stage(t3, refined(action="NO_CHANGE",
+                                         md_text=before, tid="T3"),
+                             tmp_path, vocab=VOCAB,
+                             ledger_name="data/" + ledger_name,
+                             key="SUB|q|T3")
+    assert st3 == "no_change"                  # all mode: sent, nothing to fix
     # all three rows landed under ONE ledger, one subject prefix
     ledger = tmp_path / "data" / ledger_name
     got = [json.loads(l) for l in ledger.read_text().splitlines()]
     assert {g["table_id"] for g in got} == {"T1", "T2", "T3"}
-    rep = F.write_audit(tmp_path, "SUB", api_calls=2,
+    rep = F.write_audit(tmp_path, "SUB", api_calls=3,
                         regression=[{"regression_ok": True,
                                      "counts": {"questions": 1}}])
     for field in ("total_tables", "tables_unchanged", "tables_refined",
@@ -619,7 +624,7 @@ def test_audit_report_fields_and_cli(tmp_path, capsys, monkeypatch):
     assert rep["tables_unchanged"] == 1
     assert rep["medical_spelling_repairs"] == 1
     assert rep["rejected_hallucinations"] == 1
-    assert rep["gemini_api_calls"] == 2
+    assert rep["gemini_api_calls"] == 3
     assert rep["before_after_regression"]["ok"] is True
     corr = rep["corrections"]
     assert len(corr) == 1

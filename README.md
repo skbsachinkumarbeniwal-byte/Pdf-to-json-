@@ -205,14 +205,20 @@ dashboard binds it and Railway exposes the public URL automatically.
    full verdict (keys → model → a real call → validator) in one shot.
 8. **Final table refinement** (`qbank/refine_final.py`) — after
    extraction and the rearrangement pass, every logical table gets a
-   deterministic PRE-CHECK first: QA-flagged fragments, long cells,
-   list-like cells, `50 – 300`-style range spacing and lost-space
-   artefacts. A table that trips none of them is clean — it is kept
-   as-is and NEVER sent to Gemini (cost control). A table that trips
-   one is rendered as page crops (3× zoom PNG of each source region —
-   the source visual is the AUTHORITY) and sent with the current
-   pipe-markdown, its metadata and up to 300 chars of surrounding
-   text. The model returns one JSON per table:
+   final pass. In `all` mode (the default) **EVERY** table is sent to
+   Gemini for refinement — a table that needs no correction simply
+   comes back as `NO_CHANGE` and ships byte-identical.
+   `QBANK_FINAL_REFINE=flagged` narrows the calls to QA-flagged
+   tables, `=off` disables the stage. A deterministic pre-check
+   (QA-flagged fragments, long cells, list-like cells, `50 – 300`-
+   style range spacing, lost-space artefacts) still runs on every
+   table and its reasons are recorded in the ledger row for auditing,
+   but it no longer gates the call — the safety comes from the
+   fidelity validator below. Each table is rendered as page crops
+   (3× zoom PNG of each source region — the source visual is the
+   AUTHORITY) and sent with the current pipe-markdown, its metadata
+   and up to 300 chars of surrounding text. The model returns one
+   JSON per table:
    `NO_CHANGE` | `REFINED` | `REVIEW` plus a
    `changes[{cell, before, after, reason, confidence, evidence}]`
    list. It may repair genuine extraction damage (split/glued words,
@@ -239,9 +245,10 @@ dashboard binds it and Railway exposes the public URL automatically.
    truth, deduped by subject|question|table id). Nothing the stage
    does may touch questions, answers, solutions, images, or the table
    count/ids/source pages — a before/after snapshot of every record
-   is verified per chapter and the result is printed. The whole stage
-   is on by default, gated by the pre-check: `QBANK_FINAL_REFINE=
-   flagged` narrows it to QA-flagged tables, `=off` disables it.
+   is verified per chapter and the result is printed. The stage is on
+   by default with `all` (every table sent): `QBANK_FINAL_REFINE=
+   flagged` narrows the calls to QA-flagged tables, `=off` disables
+   it.
    Responses are cached under `<output>/llm_cache/` like the other
    passes. Per-book audit in
    `<output>/data/table_refinement_audit.json` (totals, repair
@@ -367,8 +374,9 @@ for rearranging, doubled automatically when an answer hits the cap);
 `QBANK_LLM_TABLES=0` switches the whole Gemini pass off;
 `QBANK_REFINE=flagged|off` narrows/disables the rearrangement;
 `QBANK_FINAL_REFINE=all|flagged|off` controls the FINAL table
-refinement stage (default `all` — every table is still pre-checked
-deterministically first, so clean tables never cost an API call);
+refinement stage (default `all` — EVERY table is sent for
+refinement, so each table costs one cached call; `flagged` narrows
+the calls to QA-flagged tables);
 `QBANK_LLM_PREFLIGHT=0` skips the startup model check;
 `QBANK_MAX_CALLS_PER_DAY` caps calls per key (pool state in
 `<output>/data/keypool_state.json`); `QBANK_MAX_CALLS_PER_MINUTE`

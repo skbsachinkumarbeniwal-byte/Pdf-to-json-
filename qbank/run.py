@@ -106,10 +106,11 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
               f"{stats.get('invalid', 0)} invalid (original kept), "
               f"{stats.get('skip', 0)} skipped")
     # FINAL table refinement (presentation + medically safe repair):
-    # deterministic pre-check gates the Gemini calls (clean tables
-    # never reach the model), every answer is judged by the
-    # deterministic fidelity validator (accept / review / reject).
-    # QBANK_FINAL_REFINE=all (pre-check gated) | flagged | off
+    # `all` (default) sends EVERY table, `flagged` only QA-flagged
+    # tables; every answer is judged by the deterministic fidelity
+    # validator (accept / review / reject) — the pre-check's reasons
+    # are still recorded on the ledger row, the safety is unchanged.
+    # QBANK_FINAL_REFINE=all | flagged | off
     final_only = os.environ.get("QBANK_FINAL_REFINE", "all")
     final_stats: dict = {}
     final_regression = None
@@ -147,7 +148,7 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         print(f"[{subject}] {chapter_id}: final table refinement — "
               f"{final_stats.get('accepted', 0)} refined, "
               f"{final_stats.get('no_change', 0)} no-change, "
-              f"{final_stats.get('skip', 0)} precheck-clean, "
+              f"{final_stats.get('skip', 0)} skipped, "
               f"{final_stats.get('rejected', 0)} rejected, "
               f"{final_stats.get('review', 0)} review, "
               f"{final_stats.get('empty', 0)} no-answer, "

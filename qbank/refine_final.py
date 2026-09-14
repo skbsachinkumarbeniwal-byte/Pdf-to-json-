@@ -6,11 +6,17 @@ written. It reuses the existing records, table geometry, QA flags,
 review queue and ledger conventions — nothing here re-extracts or
 re-merges anything:
 
-    DETERMINISTIC PRE-CHECK (this module, zero API)
-        clean      -> keep unchanged, NO Gemini call (cost rule)
-        suspicious -> Gemini visual refinement:
-                       crop image of the printed table + current
-                       pipe-markdown + metadata + optional context text
+    MODES (QBANK_FINAL_REFINE)
+        all (default) -> EVERY table is sent for Gemini refinement;
+                         a table that needs no correction comes back
+                         as NO_CHANGE and ships byte-identical
+        flagged       -> only QA-flagged tables are sent
+        off           -> the stage is disabled entirely
+    A deterministic pre-check (this module, zero API) still runs on
+    every table and its reasons are recorded on the ledger row for
+    auditing — it no longer gates the call. The Gemini visual
+    refinement receives the crop image of the printed table + the
+    current pipe-markdown + metadata + optional context text.
     DETERMINISTIC FIDELITY VALIDATOR (before vs after, zero API)
         same rows x columns, every cell maps 1:1, and the cell's
         character stream is identical after whitespace / <br> /
@@ -56,8 +62,9 @@ from .tables import qa_suspects
 LEDGER = "table_refinement.jsonl"
 AUDIT = "table_refinement_audit.json"
 
-# pre-check thresholds (deterministic; a table that trips NONE of
-# these is considered clean and never reaches the model)
+# pre-check thresholds (deterministic; the reasons are recorded on
+# the ledger row for auditing — in `all` mode they no longer gate
+# the Gemini call, the safety comes from the fidelity validator)
 LONG_CELL_CHARS = 70
 LIST_SEPARATORS = 2          # "A; B; C" = 2 separators = list-like
 
@@ -189,8 +196,10 @@ def _nums_ordered(text: str) -> list:
 # --------------------------------------------------------- pre-check
 
 def precheck(t: dict, vocab=None) -> list:
-    """Deterministic suspicion signals. Empty list = the table is
-    already clean: no Gemini call, no cost, no change."""
+    """Deterministic suspicion signals, recorded on the ledger row
+    for auditing. In `all` mode (the default) they no longer gate
+    the Gemini call — every table is sent; the safety still comes
+    from the fidelity validator below."""
     reasons = []
     v = t.get("validation") or {}
     qa = v.get("table_qa") or {}
@@ -600,8 +609,10 @@ def final_refine_table(t: dict, book, fn, only: str = "all",
     """Run the final refinement stage on ONE table record in place.
     fn: refine_final factory output (book, regions, t, md, context)
         -> {table_id, action, refined_table, changes} | None.
-    Returns "skip" | "no_change" | "accepted" | "rejected" |
-    "review" | "empty" | "invalid"."""
+    only: "all" -> EVERY table is sent for refinement; "flagged"
+          -> only QA-flagged tables are sent.
+    Returns "skip" (no markdown) | "no_change" | "accepted" |
+    "rejected" | "review" | "empty" | "invalid"."""
     md = (t.get("markdown") or "").strip()
     if not md:
         return "skip"
@@ -611,7 +622,11 @@ def final_refine_table(t: dict, book, fn, only: str = "all",
     if only == "flagged":
         call = qa_flagged(t)
     elif only == "all":
-        call = bool(reasons) or qa_flagged(t)
+        # all mode: EVERY table is sent for refinement — the
+        # pre-check no longer gates the call (its reasons are still
+        # recorded on the ledger row); a table that needs no
+        # correction simply comes back as NO_CHANGE
+        call = True
     else:                      # unknown mode: fail safe, no model
         call = False
     ans = None
