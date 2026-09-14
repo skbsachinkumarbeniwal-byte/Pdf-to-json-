@@ -106,6 +106,15 @@ SALVAGE_SAMPLES = 3
 _salvage_samples_left = SALVAGE_SAMPLES
 
 
+def reset_samples() -> None:
+    """Give a new run its own sample budget: the counters are process
+    globals, so without this the second book in a long-lived dashboard
+    process would log no samples at all."""
+    global _reject_samples_left, _salvage_samples_left
+    _reject_samples_left = REJECT_SAMPLES
+    _salvage_samples_left = SALVAGE_SAMPLES
+
+
 def _note_salvage(t: dict) -> None:
     global _salvage_samples_left
     if _salvage_samples_left <= 0:

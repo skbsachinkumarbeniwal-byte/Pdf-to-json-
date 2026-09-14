@@ -221,6 +221,11 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
     llm_fn = verify_fn = refine_fn = None
     from . import llm as llm_mod
     if llm_mod.enabled():
+        # per-RUN, not per-process: the dashboard is long-lived, so
+        # otherwise run 2 would print no error lines and no samples
+        llm_mod.reset_error_reports()
+        from . import refine as refine_mod
+        refine_mod.reset_samples()
         llm_fn = llm_mod.transcriber(output_root / "llm_cache")
         verify_fn = llm_mod.verifier(output_root / "llm_cache")
         refine_fn = llm_mod.refiner(output_root / "llm_cache")

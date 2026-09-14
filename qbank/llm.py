@@ -444,6 +444,14 @@ def _hint_for(code: int) -> str:
     return _HTTP_HINTS.get(code, "")
 
 
+def reset_error_reports() -> None:
+    """Clear the once-per-signature dedupe. Called at the START of every
+    run: the dedupe is meant per RUN, not per process — the dashboard is
+    a long-lived Flask process, so a process-wide dedupe would print a
+    failure once ever and then stay silent on every later re-run."""
+    _ERRORS_SEEN.clear()
+
+
 def _fp8(text: str) -> str:
     """Short fingerprint — used in cache keys (never for secrets)."""
     return hashlib.sha1(text.encode()).hexdigest()[:8]
