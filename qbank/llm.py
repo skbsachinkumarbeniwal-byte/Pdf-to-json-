@@ -38,6 +38,7 @@ from . import keypool
 
 API = ("https://generativelanguage.googleapis.com/v1beta/models/"
        "{model}:generateContent")
+MODELS_API = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 PROMPT = """You are a precision transcription engine for a medical
@@ -392,13 +393,112 @@ def _post(url: str, payload: dict, key: str) -> dict:
             raise
 
 
+# ---- loud failure reporting -------------------------------------------
+# Nothing here may fail silently. A `return None` with no explanation
+# made a revoked key, a wrong model id, a blocked answer and a dead
+# network look IDENTICAL in the run log ("no-answer"), so a whole book
+# could ship raw tables with no clue why. Every distinct failure now
+# prints once (deduped, key material never included) with the likely fix.
+
+_ERRORS_SEEN: set[str] = set()
+
+_HTTP_HINTS = {
+    400: "invalid request — usually a bad/revoked API key or a bad parameter",
+    401: "unauthorized — the API key is missing or revoked",
+    403: "forbidden — this key/project may not have access to the model",
+    404: ("model not found — check QBANK_LLM_MODEL "
+          "(run: python scripts/check_gemini.py)"),
+    429: "quota/rate limit — free-tier cap or request burst",
+    500: "Gemini server error",
+    503: "Gemini overloaded",
+}
+
+
+def _http_detail(e) -> str:
+    """'HTTP 404 NOT_FOUND models/x is not found' — the key is never in
+    the URL or the body, so this is safe to print."""
+    try:
+        body = e.read().decode("utf-8", "replace")
+    except Exception:                          # noqa: BLE001
+        body = ""
+    try:
+        err = json.loads(body).get("error") or {}
+        return (f"HTTP {e.code} {err.get('status', '')} "
+                f"{err.get('message', '')}").strip()[:400]
+    except Exception:                          # noqa: BLE001
+        return f"HTTP {e.code} {body.strip()[:300]}".strip()
+
+
+def report_error(what: str, detail: str, hint: str = "") -> None:
+    """One API failure, printed once per unique signature."""
+    sig = hashlib.sha1(f"{what}|{detail[:200]}".encode()).hexdigest()[:8]
+    if sig in _ERRORS_SEEN:
+        return
+    _ERRORS_SEEN.add(sig)
+    print(f"[gemini] {what}: {detail}", flush=True)
+    if hint:
+        print(f"[gemini]   -> {hint}", flush=True)
+
+
+def _hint_for(code: int) -> str:
+    return _HTTP_HINTS.get(code, "")
+
+
+def _fp8(text: str) -> str:
+    """Short fingerprint — used in cache keys (never for secrets)."""
+    return hashlib.sha1(text.encode()).hexdigest()[:8]
+
+
+def _max_tokens(default: int) -> int:
+    """Output budget per call; QBANK_LLM_MAX_TOKENS overrides. Thinking
+    models spend this budget on reasoning too, so a tight cap shows up
+    as MAX_TOKENS + a truncated or empty answer."""
+    try:
+        return max(256, int(os.environ.get("QBANK_LLM_MAX_TOKENS", default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _answer_text(resp: dict) -> tuple[str, str]:
+    """(visible answer, reason when there is none). Thought parts are
+    never the answer — thinking models return them next to it."""
+    cands = resp.get("candidates") or []
+    if not cands:
+        fb = resp.get("promptFeedback") or {}
+        return "", (f"no candidates returned "
+                    f"(blockReason={fb.get('blockReason') or 'none'})")
+    cand = cands[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    txt = "".join(p.get("text", "") for p in parts
+                  if not p.get("thought")).strip()
+    if txt:
+        return txt, ""
+    fin = cand.get("finishReason") or "unknown"
+    if fin == "MAX_TOKENS":
+        return "", ("finishReason=MAX_TOKENS — the answer hit the output "
+                    "cap (thinking tokens count towards it); retrying "
+                    "with a bigger budget")
+    return "", f"empty answer (finishReason={fin})"
+
+
+def _bump_cap(payload: dict) -> dict:
+    """Double max_output_tokens (never past the model ceiling) so a
+    thinking model that ate the whole budget gets room to answer."""
+    gen = dict(payload.get("generationConfig") or {})
+    cap = int(gen.get("max_output_tokens") or 0)
+    if not cap or cap >= 65536:
+        return payload
+    gen["max_output_tokens"] = min(cap * 2, 65536)
+    return {**payload, "generationConfig": gen}
+
+
 def _call(pool, key: str, model: str, payload: dict):
     """One generateContent exchange with pool-aware key rotation.
     Returns the parsed rows or None — the caller keeps the
     deterministic output. A 429 that survives _post's burst retries
     rotates to the next pool key (bounded by pool size) without
     spending a parse-retry attempt; anything else gives up on the
-    spot, exactly like the old single-key behaviour."""
+    spot (loudly — see report_error)."""
     rot, attempt = 0, 0
     while attempt < 3:
         try:
@@ -410,17 +510,19 @@ def _call(pool, key: str, model: str, payload: dict):
             if pool is not None and e.code == 429 and rot < len(pool.keys):
                 try:
                     body = e.read().decode("utf-8", "replace")
-                except Exception:
+                except Exception:              # noqa: BLE001
                     body = ""
                 pool.note_429(body)
                 rot += 1
                 continue
+            report_error(f"{model} call failed", _http_detail(e),
+                         _hint_for(e.code))
             return None
-        except Exception:      # network dead / PoolExhausted: det output
+        except Exception as e:   # network dead / PoolExhausted: det output
+            report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
+                         "network unreachable from this host?")
             return None
-        cand = (resp.get("candidates") or [{}])[0]
-        parts = (cand.get("content") or {}).get("parts") or []
-        txt = "".join(pt.get("text", "") for pt in parts).strip()
+        txt, why = _answer_text(resp)
         if txt:
             txt = re.sub(r"^```(?:json)?|```$", "", txt)
             try:
@@ -429,8 +531,64 @@ def _call(pool, key: str, model: str, payload: dict):
                 rows = None
             if rows is not None:
                 return rows
+            why = "answer was not the expected JSON"
+        report_error(f"{model} no usable answer", why)
+        if "MAX_TOKENS" in why:
+            payload = _bump_cap(payload)   # then retry with more room
         attempt += 1           # RECITATION/SAFETY filters: retry
     return None
+
+
+def list_models(key: str, timeout: int = 30) -> list[dict]:
+    """The models THIS key can see (same auth path the calls use)."""
+    req = urllib.request.Request(MODELS_API, headers={"x-goog-api-key": key})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return (json.loads(r.read()) or {}).get("models") or []
+
+
+def check_model(model: str | None = None, pool=None,
+                key: str | None = None) -> bool:
+    """Preflight: does THIS key actually serve THIS model id, through
+    the SAME header auth the calls use? Prints a one-line verdict, and
+    when the model is wrong it lists the ids that WOULD work — so a bad
+    QBANK_LLM_MODEL is caught before an hour-long run instead of during
+    it. Returns True when the model is usable."""
+    model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
+    pool = pool or (None if key else keypool.get_pool())
+    key = key or os.environ.get("GEMINI_API_KEY", "")
+    try:
+        k = pool.acquire() if pool is not None else key
+    except Exception as e:                     # noqa: BLE001
+        report_error("no usable key in the pool", f"{type(e).__name__}: {e}")
+        return False
+    if not k:
+        report_error("no API key", "neither GEMINI_API_KEY nor GEMINI_API_KEYS "
+                                   "is set in this environment")
+        return False
+    try:
+        req = urllib.request.Request(f"{MODELS_API}/{model}",
+                                     headers={"x-goog-api-key": k})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            info = json.loads(r.read()) or {}
+        print(f"[gemini] model check OK: {model} "
+              f"({info.get('displayName', '?')})", flush=True)
+        return True
+    except urllib.error.HTTPError as e:
+        report_error("model check failed", _http_detail(e), _hint_for(e.code))
+    except Exception as e:                     # noqa: BLE001
+        report_error("model check failed", f"{type(e).__name__}: {e}",
+                     "the host cannot reach generativelanguage.googleapis.com")
+        return False
+    try:                        # wrong model id: say what WOULD work
+        avail = sorted(m["name"].split("/")[-1] for m in list_models(k)
+                       if "generateContent" in
+                       (m.get("supportedGenerationMethods") or []))
+        print("[gemini]   models this key can use: "
+              + ", ".join(avail[:12]) + (" ..." if len(avail) > 12 else ""),
+              flush=True)
+    except Exception:                          # noqa: BLE001
+        pass
+    return False
 
 
 def _cache_path(cache_dir: Path, book, pg: int, box) -> Path:
@@ -470,10 +628,12 @@ def transcriber(cache_dir: Path | None = None, model: str | None = None,
                     {"inline_data": {"mime_type": "image/png", "data": b64}},
                     {"text": PROMPT}]}],
                 "generationConfig": {"temperature": 0.0,
-                                     "max_output_tokens": 8192},
+                                     "max_output_tokens": _max_tokens(8192)},
             }
             rows = _call(pool, key, model, payload)
-        except Exception:
+        except Exception as e:                 # noqa: BLE001
+            report_error("page image could not be prepared for Gemini",
+                         f"{type(e).__name__}: {e}")
             rows = None
         if cache is not None and rows is not None:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -533,10 +693,12 @@ def verifier(cache_dir: Path | None = None, model: str | None = None,
                     {"text": VERIFY_PROMPT.format(
                         suspects=", ".join(suspects))}]}],
                 "generationConfig": {"temperature": 0.0,
-                                     "max_output_tokens": 8192},
+                                     "max_output_tokens": _max_tokens(8192)},
             }
             rows = _call(pool, key, model, payload)
-        except Exception:
+        except Exception as e:                 # noqa: BLE001
+            report_error("page image could not be prepared for Gemini",
+                         f"{type(e).__name__}: {e}")
             rows = None
         if cache is not None and rows is not None:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -598,7 +760,9 @@ one row per line, every row with the same number of columns:
 
 def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
     """generateContent exchange returning raw text (markdown), with the
-    same pool/retry discipline as _call."""
+    same pool/retry discipline as _call — plus a LOUD report of every
+    failure and one automatic retry with a bigger budget when the model
+    ran out of output tokens before it finished the table."""
     rot, attempt = 0, 0
     while attempt < 3:
         try:
@@ -610,19 +774,24 @@ def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
             if pool is not None and e.code == 429 and rot < len(pool.keys):
                 try:
                     body = e.read().decode("utf-8", "replace")
-                except Exception:
+                except Exception:              # noqa: BLE001
                     body = ""
                 pool.note_429(body)
                 rot += 1
                 continue
+            report_error(f"{model} call failed", _http_detail(e),
+                         _hint_for(e.code))
             return None
-        except Exception:
+        except Exception as e:                 # noqa: BLE001
+            report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
+                         "network unreachable from this host?")
             return None
-        cand = (resp.get("candidates") or [{}])[0]
-        parts = (cand.get("content") or {}).get("parts") or []
-        txt = "".join(pt.get("text", "") for pt in parts).strip()
+        txt, why = _answer_text(resp)
         if txt:
             return re.sub(r"^```(?:markdown)?|```$", "", txt).strip()
+        report_error(f"{model} no usable answer", why)
+        if "MAX_TOKENS" in why:
+            payload = _bump_cap(payload)       # retry with more room
         attempt += 1
     return None
 
@@ -645,15 +814,19 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
                                 else [pgs])] or [1]
         cache = None
         if cache_dir is not None:
+            # R7: the MODEL and the PROMPT are part of the identity — a
+            # cached answer from another model (or from an older prompt)
+            # must never be served as if it were this one's.
             sig = hashlib.sha1(
-                f"R6|{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
+                f"R7|{model}|{_fp8(REARRANGE_PROMPT)}|"
+                f"{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
                 f"{hashlib.sha1(current_md.encode()).hexdigest()}"
                 .encode()).hexdigest()
             cache = cache_dir / f"{sig}.json"
             if cache.exists():
                 try:
                     return json.loads(cache.read_text())
-                except Exception:
+                except Exception:              # noqa: BLE001
                     pass
         ask = REARRANGE_PROMPT
         if len(pgs) > 1:
@@ -665,7 +838,7 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
             "contents": [{"parts": [
                 {"text": ask + "\n\nExtraction:\n" + current_md}]}],
             "generationConfig": {"temperature": 0.0,
-                                 "max_output_tokens": 8192},
+                                 "max_output_tokens": _max_tokens(16384)},
         }
         try:
             txt = _call_text(pool, key, model, payload)

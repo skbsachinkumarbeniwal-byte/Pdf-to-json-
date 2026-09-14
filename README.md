@@ -186,7 +186,23 @@ dashboard binds it and Railway exposes the public URL automatically.
    markdown is what ships, with the original preserved under
    `validation.pre_gemini_markdown` (`QBANK_REFINE=flagged` narrows it
    to flagged tables, `=off` disables). Responses cached under
-   `<output>/llm_cache/`. Without a key the pipeline stays zero-LLM.
+   `<output>/llm_cache/` (the key includes the model and the prompt, so
+   changing either re-asks). Without a key the pipeline stays zero-LLM.
+
+   **Nothing about this pass fails silently.** At run start one GET
+   verifies the key + the model id (`[gemini] model check OK: ...`, or
+   the failure with the ids that WOULD work; `QBANK_LLM_PREFLIGHT=0`
+   skips it), and every per-chapter log line reports
+   `N rearranged, N unchanged, N no-answer, N invalid, N skipped`.
+   HTTP failures print their status and Google's message once with the
+   likely fix; a truncated answer (`finishReason=MAX_TOKENS` — a
+   thinking model can spend the whole output budget on reasoning) is
+   automatically retried with double the budget; an answer that is a
+   table plus a sentence of preamble/fences is trimmed to that ONE
+   table block (marked `table_qa.salvaged_from_wrapper`); answers with
+   two candidate tables are still refused — arrangement is the model's
+   job, guessing is not. Run `python scripts/check_gemini.py` for the
+   full verdict (keys → model → a real call → validator) in one shot.
 8. **Gate** (`qbank/export.py`) — the zip builds as soon as every
    chapter is on disk and the book's REVIEW tables are all decided;
    census failures / unresolved q_ids ship as receipt advisories.
@@ -274,7 +290,7 @@ python scripts/verify_extraction.py <book.pdf> BIO qbank_output
 ## Tests
 
 ```bash
-python -m pytest tests/ -q        # 21 tests, no fixtures needed
+python -m pytest tests/ -q        # full suite, no fixtures needed
 ```
 
 - `test_glyphs.py` — every artifact class of the frozen repair table.
@@ -294,6 +310,32 @@ deterministic and receipts say `llm_tables_repaired: 0` honestly.
 `OUTPUT_DIR` overrides the output root (default `qbank_output/`);
 `QBANK_PDFS_DIR` adds a PDF search directory; `QBANK_BOOKS` overrides
 `books.json`.
+
+`QBANK_LLM_MODEL` picks the model (default `gemini-3.5-flash-lite`);
+`QBANK_LLM_MAX_TOKENS` caps one answer's output tokens (default 16384
+for rearranging, doubled automatically when an answer hits the cap);
+`QBANK_LLM_TABLES=0` switches the whole Gemini pass off;
+`QBANK_REFINE=flagged|off` narrows/disables the rearrangement;
+`QBANK_LLM_PREFLIGHT=0` skips the startup model check;
+`QBANK_MAX_CALLS_PER_DAY` caps calls per key (pool state in
+`<output>/data/keypool_state.json`).
+
+### Dashboard par GEMINI ON hai par tables raw aa rahi hain?
+
+Ye order follow karo — har step apna reason khud print karta hai:
+
+1. `python scripts/check_gemini.py` — keys + model + ek real call +
+   validator, sab ek saath. Ye sabse pehla step hai.
+2. Run log me `[gemini] ...` lines dekho: HTTP status + Google ka
+   message + hint wahan likha hota hai (`model not found`, `API key
+   not valid`, `quota`, `network unreachable`).
+3. Per-chapter line padho: `N invalid` = model ne table ke bajaye
+   kuch aur bheja (sample log me print hota hai), `N no-answer` =
+   call se kuch aaya hi nahi (reason upar `[gemini]` me), `N skipped` =
+   `QBANK_REFINE=flagged` aur wo table flagged nahi thi.
+4. Phir bhi clear na ho to ek chhota run karo aur uske `[gemini]`
+   lines bhejo — ab har failure apna reason likhti hai, chup-chaap
+   kuch nahi hota.
 
 ## Web dashboard (Railway)
 

@@ -677,8 +677,8 @@ async function refresh(){
  const st=await fetch("/api/status").then(r=>r.json());
  const g=st.gemini||{};
  $('gembadge').innerHTML=g.enabled
-  ?'<span class="badge b-ok">GEMINI ON</span>'
-  :'<span class="badge b-err">GEMINI OFF — '+(g.keys?'LLM disabled':'no API key')+', tables raw rahengi</span>';
+  ?'<span class="badge b-ok" title="model '+g.model+'">GEMINI ON</span>'
+  :'<span class="badge b-err" title="model '+g.model+'">GEMINI OFF — '+(g.keys?'LLM disabled':'no API key')+', tables raw rahengi</span>';
  $('books').innerHTML=st.books.map(b=>{
   const j=b.job;
   const badge=j==="running"?'<span class="badge b-run">RUNNING</span>'
