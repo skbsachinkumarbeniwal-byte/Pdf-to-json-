@@ -314,7 +314,9 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
         final_fn = llm_mod.refine_final(output_root / "llm_cache",
                                         counter=fcalls)
         model_id = os.environ.get("QBANK_LLM_MODEL", llm_mod.DEFAULT_MODEL)
-        print(f"[{subject}] Gemini table pass enabled (model {model_id})")
+        chain = llm_mod._model_chain(model_id)
+        print(f"[{subject}] Gemini table pass enabled "
+              f"(model chain: {' -> '.join(chain)})")
         # Preflight ONE GET: is this key + this model id actually
         # usable? Better to learn it now than from a whole run full of
         # "no-answer" (QBANK_LLM_PREFLIGHT=0 skips the check).

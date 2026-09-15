@@ -692,6 +692,10 @@ def _bump_cap(payload: dict) -> dict:
 DEFAULT_FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.6-flash"]
 
 
+# (primary, fallback) pairs whose switch has already been printed once
+_SHIFT_ANNOUNCED: set = set()
+
+
 def _model_chain(model: str) -> list[str]:
     """The models a single logical call may use, best first.
 
@@ -850,9 +854,18 @@ def _call(pool, key: str, model: str, payload: dict):
                                          attempts=3 if i == 0 else 1)
         if rows is not None:
             if m != model:
-                print(f"[gemini] {model} could not answer "
-                      f"({fails[-1][1] if fails else 'unusable'}) — "
-                      f"{m} answered instead")
+                # announce the shift ONCE per (primary, fallback) pair:
+                # after the shift every remaining call takes this path,
+                # and one line per call buried the run log
+                pair = (model, m)
+                if pair not in _SHIFT_ANNOUNCED:
+                    _SHIFT_ANNOUNCED.add(pair)
+                    print(f"[gemini] {model} is spent for today "
+                          f"({fails[-1][1] if fails else 'unusable'}) — "
+                          f"the chain shifted to {m} for the rest of the "
+                          f"run (its own per-key quota still applies)")
+                if os.environ.get("QBANK_LLM_VERBOSE_SHIFT") == "1":
+                    print(f"[gemini] {m} served a call (fallback)")
             return rows
         fails.append((m, kind, detail))
         if kind not in ("exhausted", "no_model", "no_answer"):

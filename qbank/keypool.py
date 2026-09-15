@@ -38,10 +38,14 @@ RPM_COOLDOWN_SECONDS = 60
 # times (with a cooldown each time) before the key is called spent
 VAGUE_429_LIMIT = 5
 DEFAULT_MAX_CALLS_PER_DAY = 480
-# The free tier allows 15 requests/minute per project: pace every key
-# at 12 so bursts never trip a 429 (env QBANK_MAX_CALLS_PER_MINUTE
-# overrides; N keys sustain N x the rate).
-DEFAULT_MAX_CALLS_PER_MINUTE = 12
+# The free tier allows 15 requests/minute per project per model. Pace
+# every key at 13 — two below the ceiling, so a burst never trips a
+# 429 while the pool still uses most of the allowance (env
+# QBANK_MAX_CALLS_PER_MINUTE overrides). The window is per (key,
+# model): N keys sustain N x 13 requests/minute on the primary model,
+# and the same again on the fallback model, because the API meters
+# each model separately.
+DEFAULT_MAX_CALLS_PER_MINUTE = 13
 
 
 def _fp(key: str) -> str:
@@ -346,8 +350,26 @@ class KeyPool:
                 "keys": [{"label": l, **v} for l, v in sorted(self.st.items())]}
 
     def summary_text(self) -> str:
-        return ", ".join(f"{l}={v['status']}({v['calls']})"
-                         for l, v in sorted(self.st.items()))
+        """One line per key, showing each model bucket — this is where
+        the primary->fallback shift becomes visible: a key reads
+        `gemini-3.5-flash-lite=exhausted/480 | gemini-3.1-flash-lite=
+        active/12` once its 3.5 budget is gone and the chain moved on."""
+        out = []
+        for l, v in sorted(self.st.items()):
+            models = v.get("models") or {}
+            named = [f"{m}={b['status']}/{b['calls']}"
+                     for m, b in sorted(models.items()) if m != LEGACY_MODEL]
+            detail = " | ".join(named) if named else v["status"]
+            out.append(f"{l}[{v['fp']}]: {detail}")
+        return "\n".join(out)
+
+    def policy_text(self) -> str:
+        """The pacing/budget contract in one line, for the run banner."""
+        n = len(self.keys)
+        return (f"{n} key(s) x {self.max_minute}/min x {self.max_calls}/day "
+                f"per key PER MODEL -> {n * self.max_minute}/min and "
+                f"{n * self.max_calls}/day per model before the chain shifts "
+                f"to the next model")
 
 
 _POOL: KeyPool | None = None
@@ -369,9 +391,10 @@ def get_pool(output_root=None, env=None) -> KeyPool | None:
             _POOL = KeyPool(keys, day,
                             state_path=root / "data" / "keypool_state.json",
                             max_calls_per_minute=minute)
-            print(f"[keypool] {len(keys)} key(s) in pool "
-                  f"(fps: {', '.join(v['fp'] for v in _POOL.st.values())}); "
-                  f"pacing {minute}/min/key x {len(keys)} keys = "
-                  f"{minute * len(keys)}/min effective, "
-                  f"cap {day}/day/key")
+            print(f"[keypool] {_POOL.policy_text()}")
+            print(f"[keypool] order: the PRIMARY model is used with every "
+                  f"key (rotating on a spent bucket) before the chain "
+                  f"shifts to the fallback model — key-major order would "
+                  f"waste the good model. Keys: "
+                  f"{', '.join(v['fp'] for v in _POOL.st.values())}")
     return _POOL

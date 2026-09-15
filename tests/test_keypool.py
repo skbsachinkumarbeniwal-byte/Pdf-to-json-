@@ -388,7 +388,8 @@ def test_a_spent_model_falls_through_to_the_next_model(monkeypatch, capsys):
     rows = llm._call(pool, "", "primary", {})
     assert rows == [["a", "b"]]
     assert seen == ["primary", "fb-model"]
-    assert "fb-model answered instead" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "the chain shifted to fb-model" in out
     # the spent bucket belongs to `primary` only: the key is not burnt
     assert pool.bucket(0, "primary")["status"] == "exhausted"
     assert pool.bucket(0, "fb-model")["status"] == "active"
@@ -401,3 +402,140 @@ def test_model_chain_off_keeps_a_single_model(monkeypatch):
     assert llm._model_chain("only") == ["only"]
     monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "only, other ,other")
     assert llm._model_chain("only") == ["only", "other"]
+
+
+def _daily_429():
+    return _http_err(429, b'{"error":{"status":"RESOURCE_EXHAUSTED",'
+                          b'"message":"Quota exceeded",'
+                          b'"details":[{"@type":"type.googleapis.com/'
+                          b'google.rpc.QuotaFailure","violations":'
+                          b'[{"quotaId":"GenerateRequestsPerDayPer'
+                          b'ProjectPerModel-FreeTier"}]}]}}')
+
+
+def _ok(ans="a"):
+    return {"candidates": [{"content": {"parts": [
+        {"text": json.dumps({"rows": [[ans]]})}]}}]}
+
+
+def test_primary_model_burns_every_key_before_the_fallback(
+        monkeypatch, tmp_path):
+    """THE multi-key policy: with 4-5 keys, the primary model must be
+    used with ALL of them before the chain shifts to the fallback model.
+    Key-major order (k1/3.5 -> k1/3.1 -> k2/3.5) would burn the better
+    model's quota on the wrong key.
+
+    Each key's primary bucket is spent through the transport — that is
+    where the pool really learns it — and after every step the assertion
+    is the same: a key whose primary bucket still has room must serve
+    the PRIMARY model, and the fallback must not be touched."""
+    from qbank import llm
+
+    pool = KeyPool(["k1", "k2", "k3"], max_calls_per_day=1000,
+                   state_path=tmp_path / "s.json")
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "fb-model")
+    spent = set()                 # keys whose primary daily bucket is gone
+    seen = []
+
+    def fake_post(api, payload, key, model=None):
+        m = model or api.rsplit("/", 1)[-1].split(":")[0]
+        seen.append((key, m))
+        if m == "primary" and key in spent:
+            raise _daily_429()
+        return _ok()
+
+    monkeypatch.setattr(llm, "_post_adaptive", fake_post)
+    monkeypatch.setattr(llm, "_post", fake_post)
+
+    # k1 spent: the call must land on k2's PRIMARY, never on the fallback
+    spent.add("k1")
+    seen.clear()
+    assert llm._call(pool, "", "primary", {}) == [["a"]]
+    assert ("k2", "primary") in seen, seen
+    assert not [x for x in seen if x[1] == "fb-model"], seen
+
+    # k1+k2 spent -> k3's primary, still no fallback
+    spent.add("k2")
+    seen.clear()
+    assert llm._call(pool, "", "primary", {}) == [["a"]]
+    assert ("k3", "primary") in seen, seen
+    assert not [x for x in seen if x[1] == "fb-model"], seen
+
+    # every key's primary bucket gone -> NOW the chain shifts model
+    spent.add("k3")
+    seen.clear()
+    assert llm._call(pool, "", "primary", {}) == [["a"]]
+    assert [x for x in seen if x[1] == "fb-model"], seen
+    assert not [x for x in seen if x[1] == "primary" and x[0] not in spent], seen
+    for i in range(3):
+        assert pool.bucket(i, "primary")["status"] == "exhausted"
+        assert pool.bucket(i, "fb-model")["status"] == "active"
+
+
+def test_fallback_model_carries_the_load_once_primaries_are_gone(
+        monkeypatch, tmp_path):
+    """After the shift, the fallback keeps rotating across every key —
+    its own 480/day bucket per key, not a single key's worth."""
+    from qbank import llm
+
+    pool = KeyPool(["k1", "k2", "k3"], max_calls_per_day=1000,
+                   state_path=tmp_path / "s.json")
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "fb-model")
+    used = []
+
+    def fake_post(api, payload, key, model=None):
+        m = model or api.rsplit("/", 1)[-1].split(":")[0]
+        used.append(key)
+        if m == "primary":
+            raise _daily_429()
+        return _ok()
+
+    monkeypatch.setattr(llm, "_post_adaptive", fake_post)
+    monkeypatch.setattr(llm, "_post", fake_post)
+
+    # a key takes max_minute calls before the rolling window pushes the
+    # pool to the next one, so drive past one window per key
+    n = pool.max_minute * len(pool.keys) + 1
+    for _ in range(n):
+        assert llm._call(pool, "", "primary", {}) == [["a"]]
+    # every key contributed fallback calls: the fallback quota is per key
+    assert set(used) == {"k1", "k2", "k3"}, used
+    for i in range(3):
+        assert pool.bucket(i, "fb-model")["calls"] >= 1
+
+
+def test_minute_pacing_uses_13_per_key_by_default():
+    from qbank import keypool
+    assert keypool.DEFAULT_MAX_CALLS_PER_MINUTE == 13
+    assert keypool.DEFAULT_MAX_CALLS_PER_DAY == 480
+    pool = keypool.KeyPool(["k1", "k2"])
+    assert pool.max_minute == 13
+    assert pool.max_calls == 480
+
+
+def test_thirteen_call_window_then_wait(monkeypatch):
+    """13 calls fit in the rolling minute; the 14th waits."""
+    from qbank import keypool
+    pool = keypool.KeyPool(["k1"])
+    t = [1000.0]
+    monkeypatch.setattr(keypool.time, "time", lambda: t[0])
+    for _ in range(13):
+        assert pool._minute_wait(0, t[0], "m") == 0.0
+        pool.note_call("m")
+    assert pool._minute_wait(0, t[0], "m") > 0
+    t[0] += 61.0                                  # window rolls over
+    assert pool._minute_wait(0, t[0], "m") == 0.0
+
+
+def test_daily_budget_is_480_per_key_per_model(monkeypatch, tmp_path):
+    """480 RPD is enforced PER KEY and PER MODEL: a second key has its
+    own 480, and the fallback model has its own 480 too."""
+    from qbank import keypool
+    pool = keypool.KeyPool(["k1", "k2"], state_path=tmp_path / "s.json")
+    for _ in range(480):
+        pool.note_call("m")
+    assert pool.bucket(0, "m")["calls"] == 480
+    assert pool.acquire("m") == "k2"          # k2 still has all 480
+    # the fallback model has its OWN 480 on every key, k1 included
+    assert pool.bucket(0, "other-model")["calls"] == 0
+    assert pool.acquire("other-model") in ("k1", "k2")
