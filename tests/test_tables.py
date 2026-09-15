@@ -181,7 +181,8 @@ def test_qa_suspects_evidence_rules():
     words = Counter({"brain": 5, "stem": 5, "brainstem": 6, "dome": 4,
                      "do": 3, "me": 3, "can": 5, "be": 6,
                      "mucoperichondrial": 3, "freer": 1, "incision": 2})
-    pairs = Counter({("brain", "stem"): 3, ("do", "me"): 0})
+    pairs = Counter({("brain", "stem"): 3, ("do", "me"): 0,
+                     ("can", "be"): 12})
     m = [["brain stem", "do me", "canbe", "Freer incision"]]
     s = qa_suspects(m, words, pairs)
     # spaced pair the book itself prints: legitimate, not a suspect
@@ -192,6 +193,14 @@ def test_qa_suspects_evidence_rules():
     assert "canbe" in s
     # proper names never enter via the pair rule
     assert "Freer" not in s and "incision" not in s
+    # a REAL word that merely contains a function word is not a glued
+    # collision: the parts must be printed next to each other for the
+    # glue hypothesis to hold (live false flags: "independent",
+    # "ingredient" — each locked the export gate as a REVIEW table)
+    words3 = Counter({"in": 900, "dependent": 4, "gredient": 2})
+    m3 = [["T cell-independent antigens", "Active ingredient in µg/mL"]]
+    s3 = qa_suspects(m3, words3, Counter())
+    assert s3 == [], s3
     # long established terms are not lost-space suspects
     assert long_space_suspects("Mucoperichondrial flap", words) == []
     assert long_space_suspects("Intracranialintradural mass", words) == \

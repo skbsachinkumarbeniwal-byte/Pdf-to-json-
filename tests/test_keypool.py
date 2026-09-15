@@ -228,6 +228,7 @@ def test_call_reports_pool_exhausted_not_network(monkeypatch, capsys):
         raise AssertionError("no HTTP attempt with a dead pool")
 
     monkeypatch.setattr(llm, "_post", boom)
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "off")
     pool = KeyPool(["k1"], max_calls_per_day=0)
     assert llm._call(pool, "", "m", {}) is None
     out = capsys.readouterr().out
@@ -251,6 +252,7 @@ def test_call_does_not_burn_keys_on_404(monkeypatch, capsys):
                              b'"message":"models/m is not found"}}')
 
     monkeypatch.setattr(llm, "_post", fake_post)
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "off")
     assert llm._call(pool, "", "m", {}) is None
     assert calls == ["k1"]
     assert pool.st["key1"]["status"] == "active"
@@ -281,3 +283,121 @@ def test_throughput_scales_with_key_count(monkeypatch):
     # 7th: all capped -> waits, then serves from the active pointer
     assert pool.acquire() == "k3"
     assert slept == [60.0]                    # then the window slides
+
+
+# ---- cooldown must WAIT, never abandon the run -------------------------
+
+def test_cooling_key_is_waited_for_not_abandoned(tmp_path, monkeypatch):
+    """A per-minute 429 puts the key in a 60 s cooldown. The pool must
+    WAIT for it: with one key, giving up meant 'pool exhausted — all 1
+    keys spent today' and every later table of the book shipped without
+    the model pass (seen on the real Microbiology run)."""
+    from qbank import keypool
+
+    pool = keypool.KeyPool(["K1"], state_path=tmp_path / "s.json",
+                           max_calls_per_minute=12)
+    pool.note_429("quotaId: GenerateRequestsPerMinutePerProjectPerModel")
+    assert pool.st["key1"]["status"] == "cooldown"
+
+    slept = []
+    monkeypatch.setattr(keypool.time, "sleep", lambda s: slept.append(s))
+    # the cooldown is a few seconds here, not a minute: fast test
+    pool.st["key1"]["cooldown_until"] = keypool.time.time() + 3.0
+    assert pool.acquire() == "K1"
+    assert slept and 0 < slept[0] <= 3.0
+
+
+def test_daily_quota_429_still_exhausts_the_key(tmp_path):
+    from qbank import keypool
+
+    pool = keypool.KeyPool(["K1"], state_path=tmp_path / "s.json")
+    pool.note_429("quotaId: GenerateRequestsPerDayPerProjectPerModel")
+    assert pool.st["key1"]["status"] == "exhausted"
+    try:
+        pool.acquire()
+    except keypool.PoolExhausted as e:
+        assert "spent today" in str(e)
+    else:                                     # pragma: no cover
+        raise AssertionError("a spent key must raise PoolExhausted")
+
+
+def test_vague_429_is_transient_until_it_repeats(tmp_path):
+    from qbank import keypool
+
+    pool = keypool.KeyPool(["K1"], state_path=tmp_path / "s.json")
+    pool.note_429("Resource has been exhausted")          # no quota id
+    assert pool.st["key1"]["status"] == "cooldown"        # transient
+    for _ in range(keypool.VAGUE_429_LIMIT):
+        pool.note_429("Resource has been exhausted")
+    assert pool.st["key1"]["status"] == "exhausted"       # now it counts
+
+
+def test_quota_is_per_model_not_per_key(tmp_path):
+    """The real cap is 'requests per DAY per PROJECT per MODEL'. One
+    model running out must NOT stop the run: the same key still serves
+    another model. (Seen live: gemini-3.5-flash-lite at 500/day while
+    gemini-3.1-flash-lite answered normally seconds later.)"""
+    from qbank import keypool
+
+    pool = keypool.KeyPool(["K1"], state_path=tmp_path / "s.json")
+    pool.note_429("quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                  model="model-a")
+    assert pool.bucket(0, "model-a")["status"] == "exhausted"
+    # the other model's bucket is untouched -> acquire() still serves
+    assert pool.acquire("model-b") == "K1"
+    try:
+        pool.acquire("model-a")
+    except keypool.PoolExhausted:
+        pass
+    else:                                       # pragma: no cover
+        raise AssertionError("model-a must be exhausted")
+    # and the per-model counters are separate
+    pool.note_call("model-b")
+    assert pool.bucket(0, "model-b")["calls"] == 1
+    assert pool.bucket(0, "model-a")["calls"] == 0
+
+
+def test_a_spent_model_falls_through_to_the_next_model(monkeypatch, capsys):
+    """Live failure this guards: gemini-3.5-flash-lite hit its 500/day
+    PER MODEL cap at 21:00 and every remaining chapter was recorded as
+    "no answer", although gemini-3.1-flash-lite answered 200 at once.
+    One logical call must therefore walk a model chain instead of
+    giving up on the whole run."""
+    from qbank import llm
+
+    pool = KeyPool(["k1"], max_calls_per_day=100)
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "fb-model")
+    seen = []
+
+    def fake_post(url, payload, key):
+        model = url.rsplit("/", 1)[-1].split(":")[0]
+        seen.append(model)
+        if model == "primary":
+            raise _http_err(429, b'{"error":{"status":"RESOURCE_EXHAUSTED",'
+                                 b'"message":"Quota exceeded",'
+                                 b'"details":[{"@type":"type.googleapis.com/'
+                                 b'google.rpc.QuotaFailure","violations":'
+                                 b'[{"quotaId":"GenerateRequestsPerDayPer'
+                                 b'ProjectPerModel-FreeTier"}]}]}}')
+        return {"candidates": [{"content": {"parts": [
+            {"text": json.dumps({"rows": [["a", "b"]]})}]}}]}
+
+    monkeypatch.setattr(llm, "_post_adaptive",
+                        lambda api, payload, key, model: fake_post(api, payload, key))
+    monkeypatch.setattr(llm, "_post", fake_post)
+    rows = llm._call(pool, "", "primary", {})
+    assert rows == [["a", "b"]]
+    assert seen == ["primary", "fb-model"]
+    assert "fb-model answered instead" in capsys.readouterr().out
+    # the spent bucket belongs to `primary` only: the key is not burnt
+    assert pool.bucket(0, "primary")["status"] == "exhausted"
+    assert pool.bucket(0, "fb-model")["status"] == "active"
+    assert pool.bucket(0, "fb-model")["calls"] == 1
+
+
+def test_model_chain_off_keeps_a_single_model(monkeypatch):
+    from qbank import llm
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "off")
+    assert llm._model_chain("only") == ["only"]
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "only, other ,other")
+    assert llm._model_chain("only") == ["only", "other"]

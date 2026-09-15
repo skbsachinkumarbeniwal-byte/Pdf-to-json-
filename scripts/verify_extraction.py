@@ -19,6 +19,24 @@ TOC page ranges) and proves, per chapter:
   4. IMAGES            embedded-image placements + table renders ==
      claimed + orphaned + skipped. Nothing silently lost.
 
+HOW THE TABLE-CELL CHECK WORKS.  A markdown cell must be printed either
+as an ordered concatenation of the zone's baseline lines (the cell was
+joined from the lines that carried it) or as a contiguous substring of a
+zone's text (the refinement re-cut a merged printed cell into rows), and
+the table's own declared source_pages are checked the same way.  The
+separators the typesetter ran together (";", ",") and the presentation
+the refinement may add ("<br>", bullets) are erased on BOTH sides, so
+every printed LETTER and DIGIT of a cell must still appear, in order.
+
+WHAT THIS DOES NOT CHECK.  norm() erases ALL whitespace, so this script
+cannot see a word-boundary corruption ("incompletely immunized" printing
+as "in completely immunized" normalises identically).  That is by design
+— re-wrapped prose must still verify — and that class is owned upstream
+by the deterministic restore path in qbank/refine.py
+(restore_split_words / segmentation_weakens, with segmentation_change a
+fatal in refine_final.py) and audited by tools/segmentation_audit.py.
+Characterised in tests/test_verify_extraction.py.
+
 Exit code 0 = all checks passed.
 
 Usage:  python3 scripts/verify_extraction.py <pdf> <subject> [output_root]
@@ -48,6 +66,20 @@ def norm(s: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
+# Presentation the table pipeline is allowed to introduce (and that the
+# printed page therefore does not show): "<br>" line breaks, bullet
+# markers, and the list separators ";" / "," between items that the
+# typesetter simply ran together. The table-cell check erases them on
+# BOTH sides — it still proves every LETTER and DIGIT of the cell is
+# printed, in order, which is what "content is in the zones" means.
+_PRESENTATION = re.compile(r"<br\s*/?>|<[A-Za-z/][^>]{0,12}>|[;,\u2022\u00b7]")
+
+
+def norm_cell(s: str) -> str:
+    """norm() for a markdown table cell (presentation erased)."""
+    return norm(_PRESENTATION.sub("", s or ""))
+
+
 RE_Q_HDR_LINE = re.compile(r"^Question\s+\d+\s*:\s*$", re.I)
 RE_S_HDR = re.compile(r"^Solution\s+to\s+Question\s+(\d+)\s*:\s*$", re.I)
 RE_KEY_LINE = re.compile(r"^Answer\s*Key\s*$", re.I)
@@ -60,11 +92,15 @@ RE_INT = re.compile(r"^\d{1,4}$")
 def visual_lines(page, printed: int):
     """Minimal independent line reader: (y0, x0, x1, text) per text
     line, footers dropped. A footer is the PRINTED PAGE NUMBER standing
-    alone near the bottom — matching only the page number, so
-    answer-key rows (lone digits low on the page) are never mistaken
-    for furniture. Sorting happens later, per baseline."""
+    alone near the bottom AND horizontally centred on the page — the
+    same two signals the pipeline uses, because the naive "number low
+    on the page" test silently deleted page 14's answer-key row
+    `14  d` (that row's number is not centred and has its option letter
+    beside it). A verifier that repeats a parser bug cannot catch it,
+    so this rule is derived from page geometry, not copied."""
     out = []
-    h = page.rect.height
+    h, w = page.rect.height, page.rect.width
+    lines = []
     for b in page.get_text("dict")["blocks"]:
         if b.get("type") != 0:
             continue
@@ -72,10 +108,17 @@ def visual_lines(page, printed: int):
             text = "".join(s["text"] for s in ln["spans"]).strip()
             if not text:
                 continue
-            y0, x0, x1 = ln["bbox"][1], ln["bbox"][0], ln["bbox"][2]
-            if text == str(printed) and ln["bbox"][3] > h * 0.88:
-                continue
-            out.append((y0, x0, x1, text))
+            lines.append((tuple(ln["bbox"]), text))
+    for bb, text in lines:
+        keep = True
+        if text == str(printed) and bb[3] > h * 0.88:
+            centred = abs((bb[0] + bb[2]) / 2 - w / 2) <= w * 0.05
+            beside = [ob for ob, _t in lines
+                      if not (ob[3] <= bb[1] - 2 or ob[1] >= bb[3] + 2)
+                      and ob != bb]
+            keep = not (centred and not beside)
+        if keep:
+            out.append((bb[1], bb[0], bb[2], text))
     return out
 
 
@@ -217,19 +260,50 @@ def _cell_in_lines(cell_norm: str, line_norms) -> bool:
     return False
 
 
-def _table_ok(md: str, *line_sets) -> bool:
-    """Every non-separator markdown row's non-empty cells must be
-    verifiable in at least one zone's baseline list."""
+def _page_line_sets(doc, pages, offset: int):
+    """(line norms, joined text) for the file pages a table declares.
+    A table's cells must be reconstructible from the pages it names —
+    that is a stricter claim than the chapter zone (which classifies
+    lines into question/solution/details buckets and can drop the ones
+    a table was assembled from)."""
+    lines, texts = [], []
+    for pg in pages:
+        fp = int(pg) + int(offset)
+        if fp < 1 or fp > doc.page_count:
+            continue
+        page = doc[fp - 1]
+        ls = []
+        for blk in page.get_text("dict")["blocks"]:
+            for ln in blk.get("lines", []):
+                txt = "".join(sp["text"] for sp in ln["spans"])
+                if txt.strip():
+                    ls.append(norm_cell(txt))
+        lines.append(ls)
+        texts.append(norm_cell(page.get_text()))
+    return lines, texts
+
+
+def _table_ok(md: str, line_sets, zone_texts=()) -> bool:
+    """Every non-separator markdown row's non-empty cell must be
+    PRINTED in the chapter: either as an ordered concatenation of the
+    zone's baseline lines (the extraction case — a cell joined from the
+    lines that printed it), or as a contiguous substring of a zone's
+    whole text (the refinement case — a cell the model re-cut, e.g. one
+    merged cell split into three, still has to exist on the page
+    letter-for-letter). Presentation is erased on both sides."""
     for row in md.splitlines():
         cells = [c.strip() for c in row.strip().strip("|").split("|")]
         if all(set(c) <= set("- ") for c in cells):
             continue                      # |---|---| separator
         for c in cells:
-            nc = norm(c)
+            nc = norm_cell(c)
             if not nc:
                 continue
-            if not any(_cell_in_lines(nc, ls) for ls in line_sets):
-                return False
+            if any(_cell_in_lines(nc, ls) for ls in line_sets):
+                continue
+            if any(nc in zt for zt in zone_texts):
+                continue
+            return False
     return True
 
 
@@ -281,7 +355,16 @@ def main() -> int:
                 md = t.get("markdown", "")
                 if not md:
                     continue
-                if not _table_ok(md, q_lns, s_lns):
+                # the cell check erases presentation on BOTH sides (the
+                # page's own commas/semicolons included: the typesetter
+                # runs list items together without separators)
+                plines, ptexts = _page_line_sets(doc, t.get("source_pages")
+                                                 or [], offset)
+                if not _table_ok(md, [[norm_cell(x) for x in q_lns],
+                                      [norm_cell(x) for x in s_lns]]
+                                 + plines,
+                                 (norm_cell(nqz), norm_cell(nsz))
+                                 + tuple(ptexts)):
                     failures.append(f"{r['q_id']}: table cells not "
                                     f"verifiable in zones ({t.get('table_id')})")
                 covered += len(norm(md))

@@ -95,7 +95,52 @@ class PageData:
     words: list = field(default_factory=list)
     images: list = field(default_factory=list)
     footers: list = field(default_factory=list)   # dropped lines (audit)
+    footer_kept: list = field(default_factory=list)  # candidates KEPT (audit)
     table_boxes: list = field(default_factory=list)  # [bbox] of RULED tables
+
+
+# How the printed page number is told apart from a REAL line that
+# happens to carry the same text. Both signals are measured from the
+# book itself (see `_footer_probe` in the repo history): on every one
+# of MARROW ED8 Microbiology's 615 pages the footer sits at y1≈775 of
+# 792 (bottom band) and is horizontally CENTRED (max 3.2 pt off the
+# page centre); something a question/answer-key row prints there is
+# neither centred (an answer-key row's number column sits ~72 pt left
+# of centre) nor alone on its baseline (its option letter is beside
+# it). The old rule tested ONLY "text == page number and low on the
+# page", so page 14's answer-key row `14  d` was thrown away with the
+# footer — the printed key row for question 14 vanished and chapter 1
+# failed its census (K=22 vs Q=23). A footer now has to be BOTH alone
+# on its baseline AND centred, so a real printed row can never be
+# mistaken for furniture.
+FOOTER_BAND = 0.88        # below this fraction of the page height
+FOOTER_CENTER_TOL = 0.05  # max |line centre - page centre| / page width
+FOOTER_BASELINE_TOL = 2.0  # pt of vertical overlap that counts as "beside"
+
+
+def _footers_of(raw_lines: list, printed: int, height: float,
+                width: float) -> tuple[list, list]:
+    """[(footer lines)], [(candidates kept — audit)] for one page."""
+    kept_audit = []
+    drop = []
+    for l in raw_lines:
+        if l.text.strip() != str(printed) or l.y1 <= height * FOOTER_BAND:
+            continue
+        centre = (l.x0 + l.x1) / 2.0
+        centred = abs(centre - width / 2.0) <= width * FOOTER_CENTER_TOL
+        neighbours = [o for o in raw_lines
+                      if o is not l
+                      and not (o.y1 <= l.y0 - FOOTER_BASELINE_TOL
+                               or o.y0 >= l.y1 + FOOTER_BASELINE_TOL)]
+        if centred and not neighbours:
+            drop.append(l)
+        else:
+            kept_audit.append(
+                {"y0": round(l.y0, 1), "x0": round(l.x0, 1),
+                 "text": l.text.strip(),
+                 "why": ("shares its baseline with another printed line"
+                         if neighbours else "not centred on the page")})
+    return drop, kept_audit
 
 
 def _ruled_table_boxes(p) -> list:
@@ -234,16 +279,21 @@ class Book:
         # then left-to-right inside a baseline.
         raw_lines.sort(key=lambda l: (round(l.y0 / 3.0), l.x0))
 
-        # --- footer: printed page number alone near the page bottom
+        # --- footer: the printed page number alone near the page bottom
+        # (only when it is ALSO centred and alone on its baseline —
+        # see _footers_of: an answer-key row can print the same number)
         printed = file_page - self.page_offset
-        kept = []
-        for l in raw_lines:
-            is_footer = (
-                l.text.strip() == str(printed)
-                and l.y1 > pd.height * 0.88
-            )
-            (pd.footers if is_footer else kept).append(l)
-        pd.lines = kept
+        drop, kept_footer_candidates = _footers_of(
+            raw_lines, printed, pd.height, pd.width)
+        drop_ids = {id(l) for l in drop}
+        pd.footers = list(drop)
+        pd.footer_kept = kept_footer_candidates
+        pd.lines = [l for l in raw_lines if id(l) not in drop_ids]
+        if kept_footer_candidates:
+            print(f"[textlayer] p{file_page}: kept a line that reads "
+                  f"{kept_footer_candidates[0]['text']!r} at the page "
+                  f"bottom — looks like printed content, not the footer "
+                  f"({kept_footer_candidates[0]['why']})")
 
         # --- words (tight boxes; geometry for the key/TOC tables and
         #     the table-cell reconstruction). Each word inherits the
@@ -256,20 +306,31 @@ class Book:
             for ln in b["lines"]:
                 for s in ln["spans"]:
                     font_spans.append((s["bbox"], s["font"]))
+        raw_words = []
         for w in p.get_text("words"):
             x0, y0, x1, y1, txt, bno, lno, _wno = w
             if not txt.strip():
-                continue
-            # drop footer page numbers here too
-            if txt.strip() == str(printed) and y1 > pd.height * 0.88:
                 continue
             cx = (x0 + x1) / 2
             for (sx0, sy0, sx1, sy1), font in font_spans:
                 if sx0 - 1 <= cx <= sx1 + 1 and sy0 - 2 <= y0 <= sy1 + 2:
                     txt = _tag_span_text(txt, font)
                     break
-            pd.words.append(Word(txt, x0, y0, x1, y1, (bno, lno)))
-
+            raw_words.append(Word(txt, x0, y0, x1, y1, (bno, lno)))
+        # same footer rule for words: same number, low, centred AND
+        # alone on its baseline (so a key-row number survives)
+        for w in raw_words:
+            low = w.y1 > pd.height * FOOTER_BAND
+            centre = (w.x0 + w.x1) / 2.0
+            centred = abs(centre - pd.width / 2.0) <= pd.width * FOOTER_CENTER_TOL
+            beside = [o for o in raw_words
+                      if o is not w
+                      and not (o.y1 <= w.y0 - 5.0 or o.y0 >= w.y1 + 5.0)]
+            is_footer = (w.text.strip() == str(printed) and low
+                         and centred and not beside)
+            if not is_footer:
+                pd.words.append(w)
+        
         # --- embedded image placements
         for info in p.get_image_info(xrefs=True):
             pd.images.append(Img(

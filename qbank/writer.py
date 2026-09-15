@@ -209,7 +209,9 @@ def write_chapter_split(*, output_root: Path, subject: str, chapter_id: str,
                         orphan_rows, manifest_rows, scan_summary: dict,
                         glyph_audit: dict, image_report_summary: dict,
                         table_stats: dict | None = None,
-                        final_refine_stats: dict | None = None) -> dict:
+                        final_refine_stats: dict | None = None,
+                        gemini_stats: dict | None = None,
+                        llm_failures: dict | None = None) -> dict:
     ch_dir = Path(output_root) / "split" / subject / chapter_id
     ch_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_jsonl(ch_dir / "questions.jsonl", q_rows)
@@ -262,6 +264,12 @@ def write_chapter_split(*, output_root: Path, subject: str, chapter_id: str,
         "glyph_fix_counts": glyph_audit,
         "images": image_report_summary,
         "tables": _with_final_refine(table_stats, final_refine_stats),
+        # a chapter whose tables were sent to Gemini and got NO answer is
+        # only half-processed: it is re-run automatically next time
+        # (see run.run_book / state.note_llm_failures)
+        "gemini": dict(gemini_stats or {}),
+        "gemini_failures": {k: v
+                            for k, v in (llm_failures or {}).items() if v},
         "phase2_pending_anchors": {},
     }
     _atomic_write_json(ch_dir / "chapter_completeness.json", completeness)

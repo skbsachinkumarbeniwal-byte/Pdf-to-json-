@@ -176,12 +176,27 @@ def audit_book(output_root: Path, subject: str | None = None) -> dict:
                                       "q_id": qid,
                                       "detail": f"correct_option={co!r}"})
 
+                # A repeated STEM is not a duplicate question: books
+                # reuse "Match the following:" / "The given life cycle
+                # belongs to which of the following organisms?" many
+                # times with DIFFERENT options and images. The row's
+                # whole content joins the fingerprint, so only a row
+                # repeated with its answers (and its pictures) is a
+                # duplicate.
+                full = " ".join([q.get("question_text") or "",
+                                 " ".join(str(o.get("text") or "")
+                                          for o in (q.get("options") or [])),
+                                 " ".join(str(i) for i in
+                                          (q.get("question_images") or [])),
+                                 str(sorted((t.get("table_id") or "")
+                                            for t in (q.get("tables") or [])))])
                 stems.append((qid, q.get("chapter_id"),
-                              _shingles(_norm_text(q.get("question_text", "")))))
+                              _shingles(_norm_text(q.get("question_text", ""))),
+                              _shingles(_norm_text(full))))
 
     # ---- duplicate detection across the whole scanned set ------------
     index: dict[str, list] = {}
-    for i, (_q, _c, sh) in enumerate(stems):
+    for i, (_q, _c, sh, _full) in enumerate(stems):
         for s in sh:
             index.setdefault(s, []).append(i)
     seen_pairs, flagged = set(), set()
@@ -198,7 +213,12 @@ def audit_book(output_root: Path, subject: str | None = None) -> dict:
                 sa, sb = stems[i][2], stems[j][2]
                 inter = len(sa & sb)
                 share = inter / min(len(sa), len(sb)) if sa and sb else 0
-                if share >= 0.8 and j not in flagged:
+                # the options/images must match too — same stem,
+                # different choices is the book's own repetition
+                fa, fb = stems[i][3], stems[j][3]
+                fshare = (len(fa & fb) / min(len(fa), len(fb))
+                          if fa and fb else 0)
+                if share >= 0.8 and fshare >= 0.8 and j not in flagged:
                     flagged.add(j)
                     flags.append({"kind": "duplicate_question",
                                   "severity": "HIGH",

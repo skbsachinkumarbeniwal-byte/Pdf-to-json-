@@ -143,3 +143,35 @@ def test_report_written_and_scan_is_read_only(tmp_path):
     after = {p: p.read_bytes() for p in
              (root / "split" / "TST" / "TST-001").iterdir()}
     assert before == after                # audit never modifies output
+
+
+def test_same_stem_different_options_is_not_a_duplicate(tmp_path):
+    """Books repeat "Match the following:" with different choices; only
+    a row repeated WITH its options/images is a duplicate (live: the
+    audit flagged three such false duplicates on the real book)."""
+    import json
+    from qbank import audit as A
+    root = tmp_path / "out"
+    ch = root / "split" / "MIC" / "MIC-001"
+    ch.mkdir(parents=True)
+    rows = [
+        {"q_id": "MIC-001-001", "chapter_id": "MIC-001",
+         "question_text": "Match the following:", "correct_option": "A",
+         "options": [{"label": "A", "text": "1-B, 2-D, 3-C, 4-A"},
+                     {"label": "B", "text": "1-B, 2-D, 3-A, 4-C"}],
+         "source_pages": [1]},
+        {"q_id": "MIC-001-002", "chapter_id": "MIC-001",
+         "question_text": "Match the following:", "correct_option": "A",
+         "options": [{"label": "A", "text": "A-2, B-1, C-3, D-4"},
+                     {"label": "B", "text": "A-3, B-2, C-1, D-4"}],
+         "source_pages": [2]},
+        {"q_id": "MIC-001-003", "chapter_id": "MIC-001",
+         "question_text": "Match the following:", "correct_option": "A",
+         "options": [{"label": "A", "text": "1-B, 2-D, 3-C, 4-A"},
+                     {"label": "B", "text": "1-B, 2-D, 3-A, 4-C"}],
+         "source_pages": [1]},
+    ]
+    (ch / "questions.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    rep = A.audit_book(root)
+    dupes = [f for f in rep["flags"] if f["kind"] == "duplicate_question"]
+    assert [f["q_id"] for f in dupes] == ["MIC-001-003"], dupes

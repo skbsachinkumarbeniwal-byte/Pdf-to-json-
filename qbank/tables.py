@@ -50,7 +50,14 @@ def build_vocab(book) -> tuple:
     counts from the raw layer (visual rows). The space repairs below
     only fire when the book itself prints the other form elsewhere —
     document-internal evidence, no external knowledge, no blanket
-    whitespace regex."""
+    whitespace regex.
+
+    Memoised on the book object: the scan touches every page, and the
+    refinement stages re-ask for the same vocabulary after extraction
+    already built it once."""
+    cached = getattr(book, "_qbank_vocab", None)
+    if cached is not None:
+        return cached
     from .textlayer import word_rows
     words: Counter = Counter()
     pairs: Counter = Counter()
@@ -65,6 +72,10 @@ def build_vocab(book) -> tuple:
                 words[t.lower()] += 1
             for a, b in zip(toks, toks[1:]):
                 pairs[(a.lower(), b.lower())] += 1
+    try:
+        book._qbank_vocab = (words, pairs)      # reuse across phases
+    except Exception:                           # noqa: BLE001
+        pass                                    # read-only book: recompute
     return words, pairs
 
 
@@ -478,6 +489,50 @@ def _box_lines(book, pg: int, box):
 
 # ------------------------------------------------------------------ box
 
+# --- punctuation spacing -------------------------------------------------
+# The corrected ED8 text layer glues/splits punctuation the same way it
+# glues words: the printed cell `...at thesame time,e.g- ...` reaches the
+# extractor as `... at the same time,e.g- ...`, and a cell wrapped by the
+# typesetter after "host" + "’s immune system" rejoins as "host ’s
+# immune system". Both are pure SPACING defects: no letter, digit or
+# symbol changes. They used to be left in the markdown, and then the
+# Gemini refinement proposed exactly this fix and the fidelity validator
+# had to REJECT it (a space is a character to the validator), so the
+# repair never reached the output.
+#
+# The rules below are the same ones the refinement prompt asks the model
+# to apply, moved into the DETERMINISTIC stage where they are counted
+# (chapter_completeness.tables.punct_space_fixes), provable and free:
+#   * no space before a closing punctuation / quote:  "host ’s" -> "host’s"
+#   * no space before , ; : ) %                       "1 , 2"   -> "1, 2"
+#   * one space after , ; : when a LETTER is on BOTH sides
+#     ("time,e.g-" -> "time, e.g-") — the letter guard keeps
+#     numbers and codes intact: "O157:H7", "1,000" and
+#     "A-4,B-3" are left exactly as printed
+# Digits are never touched on the left of the rule ("1,000" and "C2,C3"
+# stay exactly as printed: the letter guard is what keeps numeric
+# thousands and cervical-level codes intact), and no letters/digits/
+# hyphens are ever added, removed or reordered.
+_NO_SPACE_BEFORE = re.compile(r"(?<=[^\s])\s+([,;:%\)\]\u2019'\u201d])")
+_SPACE_AFTER = re.compile(r"(?<=[A-Za-z])([,;:])(?=[A-Za-z])")
+
+
+def punct_spacing(text: str) -> tuple:
+    """(repaired text, number of repairs) — spacing only, never content."""
+    if not text:
+        return text, 0
+    n = 0
+    out = text
+    for _ in range(4):                      # chained artifacts
+        fixed, k = _NO_SPACE_BEFORE.subn(r"\1", out)
+        fixed2, k2 = _SPACE_AFTER.subn(r"\1 ", fixed)
+        if not (k + k2):
+            break
+        n += k + k2
+        out = fixed2
+    return out, n
+
+
 @dataclass
 class BoxTable:
     page: int
@@ -488,6 +543,7 @@ class BoxTable:
     line_joins: int = 0
     camel_fixes: int = 0
     vocab_fixes: int = 0
+    punct_fixes: int = 0          # space around , ; : ( ) quotes repaired
     llm_fixes: int = 0
     verify_calls: int = 0
     verify_clear: bool = False
@@ -576,11 +632,20 @@ def qa_suspects(matrix: list, words, pairs=None) -> list:
     def _split2(tok):
         # a collision is only suspect when a function word is glued
         # in ("andhas", "oroptic"); content+content joins like
-        # "antihelix" (anti+helix) are legitimate medical terms
+        # "antihelix" (anti+helix) are legitimate medical terms.
+        # PAIR EVIDENCE is required too: the two parts must be printed
+        # next to each other somewhere in the book, otherwise the
+        # "glue" is just a real word that happens to contain a function
+        # word ("independent" = in+dependent, "ingredient" =
+        # in+gredient) — two false REVIEW flags on the real book came
+        # from exactly that, and a REVIEW flag locks the export gate.
         for k in range(1, len(tok)):
             if (tok[:k].lower() in _FUNC or tok[k:].lower() in _FUNC) \
                     and w.get(tok[:k], 0) >= 2 and w.get(tok[k:], 0) >= 2:
-                return True
+                if pairs is None:
+                    return True
+                if pairs.get((tok[:k].lower(), tok[k:].lower()), 0) >= 1:
+                    return True
         return False
 
     def _func_glue(tok):
@@ -734,6 +799,8 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
                     if k in t:
                         t = re.sub(rf"\b{re.escape(k)}\b", v, t)
                         bt.vocab_fixes += 1
+                t, npf = punct_spacing(t)
+                bt.punct_fixes += npf
                 t = glyphs.repair(t, counts)
                 for tok in long_space_suspects(
                         t, vocab[0] if vocab is not None else None):
@@ -782,6 +849,7 @@ class LogicalTable:
     line_joins: int
     camel_fixes: int
     vocab_fixes: int
+    punct_fixes: int
     llm_fixes: int
     cross_page: bool
     warnings: list
@@ -806,6 +874,7 @@ class LogicalTable:
                 "line_joins": self.line_joins,
                 "camel_space_fixes": self.camel_fixes,
                 "vocab_space_fixes": self.vocab_fixes,
+                "punct_space_fixes": self.punct_fixes,
                 "llm_space_repairs": self.llm_fixes,
                 "table_qa": {
                     "status": "REVIEW" if self.qa_tokens else "ok",
@@ -923,7 +992,7 @@ class ChapterTables:
         self._counter += 1
         tid = f"{self.chapter_no:03d}-T{self._counter:02d}"
         chunks = self._chains[ci]
-        matrix, joins, camels, vfix, lfix, warns = [], 0, 0, 0, 0, []
+        matrix, joins, camels, vfix, pfx, lfix, warns = [], 0, 0, 0, 0, 0, []
         dedup = False
         bts = []
         for k, (cpg, cbox, mode) in enumerate(chunks):
@@ -932,6 +1001,7 @@ class ChapterTables:
             joins += bt.line_joins
             camels += bt.camel_fixes
             vfix += bt.vocab_fixes
+            pfx += bt.punct_fixes
             lfix += bt.llm_fixes
             warns += bt.warnings
             rows = bt.rows
@@ -955,7 +1025,8 @@ class ChapterTables:
             table_id=tid, markdown=_markdown(matrix) if matrix else "",
             chunks=[(p, b) for p, b, _ in chunks],
             header_deduplicated=dedup, line_joins=joins,
-            camel_fixes=camels, vocab_fixes=vfix, llm_fixes=lfix,
+            camel_fixes=camels, vocab_fixes=vfix, punct_fixes=pfx,
+            llm_fixes=lfix,
             cross_page=len(chunks) > 1, warnings=warns,
             qa_tokens=sorted(set(qa))[:12])
         self._lt_cache[ci] = lt
@@ -975,6 +1046,7 @@ class ChapterTables:
             "line_joins": sum(t.line_joins for t in lts),
             "camel_space_fixes": sum(t.camel_fixes for t in lts),
             "vocab_space_fixes": sum(t.vocab_fixes for t in lts),
+            "punct_space_fixes": sum(t.punct_fixes for t in lts),
             "llm_space_repairs": sum(t.llm_fixes for t in lts),
             "llm_verify_calls": sum(
                 bt.verify_calls for bt in self._bt_cache.values()),

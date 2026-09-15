@@ -56,7 +56,8 @@ from collections import Counter
 from pathlib import Path
 
 from .audit import load_page_text, num_tokens
-from .refine import flagged as qa_flagged, salvage_table
+from .refine import (flagged as qa_flagged, restore_split_words,
+                     salvage_table, segmentation_weakens)
 from .tables import qa_suspects
 
 LEDGER = "table_refinement.jsonl"
@@ -76,8 +77,13 @@ _BULLET_DASH = re.compile(r"(?<![\d.])(?:^|\s)(?:[-\u2013\u2014])\s+(?!\d)")
 _BR = re.compile(r"</?[Bb][Rr]\s*/?>")
 # list separators "; " / ", " become line breaks (bullets) in a
 # presentation refinement — normalised symmetrically on BOTH sides so
-# the conversion is judged on the item content, never on the marker
-_SEP = re.compile(r"[;,]\s+")
+# the conversion is judged on the item content, never on the marker.
+# The separator and the whitespace AROUND it are both presentation:
+# "antibody,colostrum" and "antibody, colostrum" are the same cell
+# (the book's text layer drops that space all over the tables), and
+# before this the missing space made the validator call a correct
+# spacing repair a `deletion` and throw it away.
+_SEP = re.compile(r"[;,]\s*")
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 
@@ -165,14 +171,32 @@ def parse_md(md: str) -> list | None:
     return rows
 
 
+# Typographic variants of the SAME character. The source PDF is set
+# with curly quotes and thin spaces; a model that answers with the
+# straight equivalents is not changing content, and the validator used
+# to call it `content_substitution` and throw a CORRECT fix away (the
+# live case: the printed cell "the host ’s immune system" — the
+# typesetter wrapped the line before "’s" — came back as "the host's
+# immune system" and was rejected). Applied SYMMETRICALLY inside
+# display_text, so it can never hide a difference that exists on one
+# side only.
+_CHAR_EQUIV = str.maketrans({
+    "\u2019": "'", "\u2018": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"',
+    "\u00a0": " ", "\u2007": " ", "\u202f": " ", "\u2009": " ",
+})
+
+
 def display_text(text: str) -> str:
     """Presentation-normalised view of a cell: <br> -> space, list
     separators "; " / ", " -> space, leading bullet markers dropped,
+    typographic quote/space variants folded to their ASCII form,
     whitespace collapsed. Used for token comparisons and for stripping
     presentation before the character identity check (applied
     SYMMETRICALLY to both sides, so it can never hide a content change
     on one side only)."""
-    t = _BR.sub(" ", text or "")
+    t = (text or "").translate(_CHAR_EQUIV)
+    t = _BR.sub(" ", t)
     t = _SEP.sub(" ", t)
     t = _BULLET_CHAR.sub(" ", t)
     t = _BULLET_DASH.sub(" ", t)
@@ -292,7 +316,7 @@ def _confidence(mch: dict | None):
     return None
 
 
-def _classify_token_change(tb: list, ta: list, words) -> str:
+def _classify_token_change(tb: list, ta: list, vocab) -> str:
     """Character-identical but token stream changed: which repair?
     word_restore  a merged join forms an established book word
                   ("osteocal"+"cin" -> "osteocalcin", "layere"+"d"
@@ -300,6 +324,8 @@ def _classify_token_change(tb: list, ta: list, words) -> str:
                   corruption class
     spacing       un-glue / re-split / plain re-wrap
                   ("retractionnot" -> "retraction not")"""
+    from .refine import _split_vocab
+    words, _ = _split_vocab(vocab)     # bare Counter or (words, pairs)
     if words is None:
         return "spacing"
     import difflib
@@ -347,14 +373,26 @@ def _cell_change(bc: str, ac: str, words, page_nums,
     if fb == fa:
         # content-identical: presentation or a spacing-level repair
         if _new_mid_word_breaks(b, a) > 0:
-            # a NEW line break inside a word ("recep<br>tor") — the
-            # model's layout broke the source's words: a human decides
-            return {**base, "kind": "mid_word_break"}
+            # a NEW line break inside a word ("recep<br>tor"): the
+            # model's layout broke the source's words. This is not an
+            # ambiguous medical reading, it is damage — refused as
+            # fatal (live: 032-T02 shipped a REVIEW for exactly this
+            # and the human queue would have had nothing to decide).
+            return {**base, "kind": "mid_word_break",
+                    "fatal": "mid_word_break"}
         tb, ta = display_text(b).split(), display_text(a).split()
         if tb == ta:
             kind = "presentation"
         elif Counter(tb) == Counter(ta):
             kind = "reorder"        # -> REVIEW at table level
+        elif (weak := segmentation_weakens(display_text(b), display_text(a),
+                                           words))[0]:
+            # same letters, WORSE word boundaries than the book prints
+            # ("incompletely" -> "in completely"): content corruption,
+            # not a spacing fix — see refine.segmentation_weakens
+            return {**base, "kind": "segmentation_change",
+                    "fatal": "segmentation_change",
+                    "detail": {"boundaries": weak[1]}}
         else:
             kind = _classify_token_change(tb, ta, words)
             if base["evidence"] is None:
@@ -426,7 +464,8 @@ def fidelity_compare(before_md: str, after_md: str, page_nums=None,
               hallucinated addition, deletion, content substitution
               or a number change without source-page evidence.
     """
-    words = vocab[0] if vocab is not None else None
+    words = vocab          # full (words, pairs) when available: the
+    #                        boundary rule needs the pair evidence too
     out = {"verdict": "ACCEPT", "reject_reasons": [],
            "review_reasons": [], "cells_changed": [], "cells_checked": 0}
     br = parse_md(before_md)
@@ -688,6 +727,14 @@ def final_refine_table(t: dict, book, fn, only: str = "all",
                     else:
                         new_md = block
                 if status != "invalid":
+                    fwords = vocab[0] if vocab else None
+                    new_md, nseg = restore_split_words(md, new_md, fwords)
+                    if nseg:
+                        val["segmentation_repairs"] = \
+                            int(val.get("segmentation_repairs", 0)) + nseg
+                        print(f"[refine-final] {(t.get('table_id') or '?')}: "
+                              f"{nseg} word boundary repair(s) applied "
+                              f"(book-vocabulary evidence)", flush=True)
                     page_nums = _page_number_evidence(
                         page_text,
                         [int(p) for p in (t.get("source_pages") or [1])])
@@ -714,6 +761,14 @@ def final_refine_table(t: dict, book, fn, only: str = "all",
         }
         qa["refined_final_by_gemini"] = True
         t["markdown"] = new_md
+        # the REVIEW flag was judged on the pre-refinement markdown —
+        # re-judge it on what actually ships (a stale REVIEW locks the
+        # export gate even though the table is now repaired)
+        try:
+            from .refine import refresh_table_qa
+            refresh_table_qa(t, new_md, vocab)
+        except Exception:                      # noqa: BLE001
+            pass                               # never break a run for QA
     elif status == "review":
         qa["status"] = "REVIEW"
         qa["refinement_review_reason"] = "; ".join(review_reasons)
@@ -783,6 +838,7 @@ def write_audit(output_root, subject: str, api_calls: int | None = None,
     rejected_number_changes = structural_rejections = 0
     cross_page_checked = 0
     render_issues = 0
+    rejections = []          # every refused suggestion, with its reason
     for r in sorted(rows.values(), key=lambda x: x["key"]):
         if r.get("cross_page"):
             cross_page_checked += 1
@@ -800,6 +856,32 @@ def write_audit(output_root, subject: str, api_calls: int | None = None,
                         "evidence": c.get("evidence"),
                         "confidence": c.get("confidence"),
                     })
+        if r["status"] in ("rejected", "invalid", "review"):
+            # A refused suggestion is still INFORMATION: the reviewer can
+            # see exactly what Gemini wanted to change and why the
+            # validator said no. Without this the refusal was invisible
+            # (the run printed one line and the detail was nowhere).
+            for c in r.get("changes") or []:
+                rejections.append({
+                    "table_id": r.get("table_id"),
+                    "cell": c.get("cell"),
+                    "before": c.get("before"),
+                    "after": c.get("after"),
+                    "kind": c.get("kind"),
+                    "reason": c.get("reason"),
+                    "evidence": c.get("evidence"),
+                    "confidence": c.get("confidence"),
+                    "verdict": r["status"],
+                    "reject_reasons": list(r.get("reject_reasons") or []),
+                })
+            if r["status"] == "review":
+                rejections.append({
+                    "table_id": r.get("table_id"), "cell": None,
+                    "before": None, "after": None, "kind": "review",
+                    "reason": "; ".join(r.get("review_reasons") or []),
+                    "evidence": None, "confidence": None,
+                    "verdict": "review",
+                    "reject_reasons": []})
         for why in r.get("reject_reasons") or []:
             fidelity_violations += 1
             head = why.split(":", 1)[0]
@@ -855,6 +937,7 @@ def write_audit(output_root, subject: str, api_calls: int | None = None,
             "ok": reg_ok, "chapters": len(reg_rows),
             "counts": dict(reg_counts)},
         "corrections": corrections,
+        "rejected_changes": rejections,
     }
     out = output_root / "data" / AUDIT
     out.parent.mkdir(parents=True, exist_ok=True)

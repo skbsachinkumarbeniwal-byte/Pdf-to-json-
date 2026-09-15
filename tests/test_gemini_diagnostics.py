@@ -165,6 +165,7 @@ class _Resp:
 
 
 def test_check_model_ok(monkeypatch, capsys):
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "off")
     monkeypatch.setattr(llm.urllib.request, "urlopen",
                         lambda req, timeout=30: _Resp(
                             {"name": "models/m", "displayName": "Gemini M"}))
@@ -185,6 +186,7 @@ def test_check_model_lists_usable_ids_on_404(monkeypatch, capsys):
              "supportedGenerationMethods": ["embedContent"]},
         ]})
 
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "off")   # single model
     monkeypatch.setattr(llm.urllib.request, "urlopen", fake_open)
     assert llm.check_model("m", key="K") is False
     out = capsys.readouterr().out
@@ -193,7 +195,18 @@ def test_check_model_lists_usable_ids_on_404(monkeypatch, capsys):
     assert "embedding-001" not in out             # only generateContent
 
 
-def test_check_model_without_key(capsys):
+def test_check_model_without_key(monkeypatch, capsys):
+    """No key anywhere -> a clear message, not a crash.
+
+    The env is cleaned first: on a machine that HAS GEMINI_API_KEY set
+    (the normal case when running the pipeline) the pool would answer
+    the call and this test failed for the wrong reason.
+    """
+    for var in ("GEMINI_API_KEY", "GEMINI_API_KEYS"):
+        monkeypatch.delenv(var, raising=False)
+    for i in range(1, 21):
+        monkeypatch.delenv(f"GEMINI_API_KEY_{i}", raising=False)
+    monkeypatch.setattr(llm.keypool, "get_pool", lambda *a, **k: None)
     assert llm.check_model("m", key="") is False
     assert "no API key" in capsys.readouterr().out
 
@@ -219,7 +232,9 @@ def test_reject_sampling_is_capped(monkeypatch, capsys):
 
 # ---- one unambiguous table is salvaged from a chatty answer ------------
 
-NEW = "| Pharyngeal Arch | Artery |\n|---|---|\n| 1 | Maxillary |"
+# same content as TABLE, rearranged (a real rearrangement: the
+# content envelope refuses answers that add/remove characters)
+NEW = "| B | A |\n|---|---|\n| y | x |"
 
 
 @pytest.mark.parametrize("answer", [
@@ -322,3 +337,23 @@ def test_run_book_preflight_can_be_skipped(tmp_path, monkeypatch, capsys):
                  output_root=out)
     assert called == [] and "Gemini table pass enabled" in \
         capsys.readouterr().out
+
+
+def test_check_model_falls_through_to_a_model_with_quota(monkeypatch, capsys):
+    """Live failure this guards: the preflight asked the pool for a key
+    WITHOUT naming a model, got the key-level "spent today" verdict and
+    shut the whole Gemini pass off ("tables raw rahengi") — although the
+    daily cap is per MODEL and a sibling model had quota left."""
+    from qbank import keypool as kp
+
+    monkeypatch.setenv("QBANK_LLM_FALLBACK_MODELS", "fb")
+    pool = kp.KeyPool(["K1"], state_path=None)
+    pool.note_429("quotaId: GenerateRequestsPerDayPerProjectPerModel"
+                  "-FreeTier", model="m")          # primary spent
+    monkeypatch.setattr(llm.urllib.request, "urlopen",
+                        lambda req, timeout=30: _Resp(
+                            {"name": "models/fb", "displayName": "Fallback"}))
+    assert llm.check_model("m", pool=pool, key="K") is True
+    out = capsys.readouterr().out
+    assert "this run uses fb instead" in out
+    assert "model check OK: fb (Fallback)" in out

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -393,6 +394,114 @@ def _post(url: str, payload: dict, key: str) -> dict:
             raise
 
 
+# ---- thinking budget --------------------------------------------------
+# The Gemini 3.x "thinking" models spend OUTPUT tokens on internal
+# reasoning before the answer. For these passes that is pure waste: the
+# task is mechanical (transcribe / rearrange / validate against a crop)
+# and thinking tokens (a) slow every call down, (b) eat the output cap
+# so a long table answer gets truncated into MAX_TOKENS, and (c) are
+# charged as output. `thinkingLevel: "low"` is accepted for 3.x models
+# while `thinkingBudget: 0` is REJECTED with HTTP 400 INVALID_ARGUMENT
+# (verified against the live API for gemini-3.5-flash-lite) — and the
+# 2.5 generation is the other way round. Instead of hard-coding one
+# shape for one model generation, the pipeline starts with the shape
+# that fits the model id, and if the API rejects it, transparently
+# falls back and REMEMBERS the working shape for the rest of the run, so
+# a wrong guess can never cost a table.
+
+_THINKING_CHOICE: dict = {}          # model -> dict | None (probed)
+THINKING_MODES = ("level_low", "budget_0", "none")
+
+
+def _thinking_payload(model: str, mode: str) -> dict:
+    if mode == "level_low":
+        return {"thinkingLevel": "low"}
+    if mode == "budget_0":
+        return {"thinkingBudget": 0}
+    return {}
+
+
+def _thinking_mode_for(model: str) -> str:
+    """Start shape per model generation (no probing call needed)."""
+    forced = (os.environ.get("QBANK_LLM_THINKING") or "").strip().lower()
+    if forced in ("low", "level_low"):
+        return "level_low"
+    if forced in ("0", "off", "none", "budget_0"):
+        return "none"
+    if forced in THINKING_MODES:
+        return forced
+    if re.search(r"gemini-[3-9]", model):
+        return "level_low"
+    if re.search(r"gemini-2\.[5-9]", model):
+        return "budget_0"
+    return "none"
+
+
+def _apply_thinking(payload: dict, model: str) -> dict:
+    mode = _THINKING_CHOICE.get(model)
+    if mode is None:
+        mode = _thinking_mode_for(model)
+    cfg = _thinking_payload(model, mode)
+    if not cfg:
+        return payload
+    gen = dict(payload.get("generationConfig") or {})
+    gen["thinkingConfig"] = cfg
+    out = dict(payload)
+    out["generationConfig"] = gen
+    return out
+
+
+def _thinking_rejected(model: str, body: str) -> bool:
+    """True when a 400 blames the thinkingConfig we sent."""
+    b = (body or "").lower()
+    return "thinking" in b and ("invalid" in b or "support" in b
+                               or "unknown" in b)
+
+
+def _post_adaptive(url: str, payload: dict, key: str, model: str) -> dict:
+    """POST with the thinking shape this model accepts.
+
+    Tries the shape chosen for the model generation; if the API rejects
+    it, the next shape is tried immediately (the failed attempt costs
+    nothing but a round-trip) and the WORKING shape is remembered for
+    every later call in this process. Logs the shape once per model.
+    """
+    if model in _THINKING_CHOICE:
+        return _post(url, _apply_thinking(payload, model), key)
+    order = [m for m in THINKING_MODES
+             if m == _thinking_mode_for(model)] + \
+        [m for m in THINKING_MODES if m != _thinking_mode_for(model)]
+    last = None
+    for mode in order:
+        _THINKING_CHOICE[model] = mode
+        try:
+            resp = _post(url, _apply_thinking(payload, model), key)
+        except urllib.error.HTTPError as e:
+            body = ""
+            if e.code == 400:              # only this path inspects the body
+                try:
+                    body = e.read().decode("utf-8", "replace")
+                    # put the body back: the CALLER reads it again to
+                    # build the error detail line, and a consumed stream
+                    # silently degraded every 4xx message to "HTTP 404"
+                    e.fp = io.BytesIO(body.encode("utf-8"))
+                except Exception:          # noqa: BLE001
+                    body = ""
+            if e.code == 400 and _thinking_rejected(model, body):
+                _THINKING_CHOICE.pop(model, None)
+                last = (e, body)
+                continue                   # try the next shape
+            raise
+        print(f"[gemini] thinking config for {model}: {mode}"
+              + ("" if mode == "none" else
+                 f" ({_thinking_payload(model, mode)})"), flush=True)
+        return resp
+    _THINKING_CHOICE[model] = "none"
+    if last is not None:
+        raise last[0]
+    return _post(url, payload, key)
+
+
 # ---- loud failure reporting -------------------------------------------
 # Nothing here may fail silently. A `return None` with no explanation
 # made a revoked key, a wrong model id, a blocked answer and a dead
@@ -425,6 +534,20 @@ def _http_detail_text(code: int, body: str) -> str:
         return f"HTTP {code} {body.strip()[:300]}".strip()
 
 
+def _hint_for_400(body: str) -> str:
+    b = (body or "").lower()
+    if "token" in b and ("exceed" in b or "too long" in b or "maximum" in b
+                         or "size" in b):
+        return ("the request is TOO LONG for the model — shorten the "
+                "table/prompt (this is the 'chat is too long' error: it "
+                "is a property of the request, not of the key)")
+    if "thinking" in b:
+        return ("the model rejected the thinkingConfig — the pipeline "
+                "falls back automatically; set QBANK_LLM_THINKING=none "
+                "to skip the probe")
+    return _HTTP_HINTS[400]
+
+
 def _http_detail(e) -> str:
     """'HTTP 404 NOT_FOUND models/x is not found' — the key is never in
     the URL or the body, so this is safe to print."""
@@ -446,7 +569,16 @@ def report_error(what: str, detail: str, hint: str = "") -> None:
         print(f"[gemini]   -> {hint}", flush=True)
 
 
-def _hint_for(code: int) -> str:
+def _hint_for(code: int, body: str = "") -> str:
+    if code == 400 and body:
+        try:
+            return _hint_for_400(body)
+        except Exception:                  # noqa: BLE001
+            pass
+    return _hint_for_code(code)
+
+
+def _hint_for_code(code: int) -> str:
     return _HTTP_HINTS.get(code, "")
 
 
@@ -479,6 +611,39 @@ def reset_error_reports() -> None:
 def _fp8(text: str) -> str:
     """Short fingerprint — used in cache keys (never for secrets)."""
     return hashlib.sha1(text.encode()).hexdigest()[:8]
+
+
+# One prompt that is bigger than this is reported LOUDLY before it is
+# sent: the failure mode it prevents is the one that made a whole book
+# look "raw" — the API answers a too-large request with HTTP 400
+# INVALID_ARGUMENT, the pass treats it as a dead call, and every
+# remaining table of the book comes back "no-answer". The guard does not
+# block the call (a big-but-legal prompt must still work); it makes the
+# size visible, and `_hint_for` names the cause when the API refuses.
+MAX_INPUT_CHARS = int(os.environ.get("QBANK_LLM_MAX_INPUT_CHARS",
+                                     "400000"))
+_oversize_seen: set = set()
+
+
+def t_id(md_text: str) -> str:
+    """Human-readable label for a prompt that only has the markdown."""
+    first = next((l for l in (md_text or "").splitlines() if l.strip()),
+                 "")
+    return (first.strip("| ")[:32] or "table")
+
+
+def _input_size_note(what: str, text: str) -> None:
+    if len(text) <= MAX_INPUT_CHARS:
+        return
+    if what in _oversize_seen:
+        return
+    _oversize_seen.add(what)
+    report_error(
+        f"{what}: very large prompt",
+        f"{len(text)} characters (~{len(text) // 4} tokens) — close to the "
+        f"model's input ceiling",
+        "if the answer comes back empty, shorten the table or raise "
+        "QBANK_LLM_MAX_INPUT_CHARS to silence this note")
 
 
 def _max_tokens(default: int) -> int:
@@ -524,48 +689,135 @@ def _bump_cap(payload: dict) -> dict:
     return {**payload, "generationConfig": gen}
 
 
-def _call(pool, key: str, model: str, payload: dict):
-    """One generateContent exchange with pool-aware key rotation.
-    Returns the parsed rows or None — the caller keeps the
-    deterministic output. A 429 that survives _post's burst retries —
-    or a failure that blames the key itself (revoked key, quota 403) —
-    rotates to the next pool key (bounded by pool size) without
-    spending a parse-retry attempt; anything else gives up on the
-    spot (loudly — see report_error)."""
-    rot, attempt = 0, 0
-    while attempt < 3:
+DEFAULT_FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.6-flash"]
+
+
+def _model_chain(model: str) -> list[str]:
+    """The models a single logical call may use, best first.
+
+    WHY: Gemini's free tier caps requests PER DAY PER PROJECT **PER
+    MODEL** (500/day for gemini-3.5-flash-lite). Once that model's
+    bucket is spent every later call returns 429 for the rest of the
+    day, and the pipeline used to record "no answer" for whole
+    chapters although a sibling model answered 200 a second later.
+    Chain = the configured model + QBANK_LLM_FALLBACK_MODELS (comma
+    separated; "off" disables). A model the API does not serve (404)
+    or one whose daily bucket is spent is skipped, not fatal."""
+    env = os.environ.get("QBANK_LLM_FALLBACK_MODELS")
+    if env is None:
+        extra = DEFAULT_FALLBACK_MODELS
+    elif env.strip().lower() in ("off", "none", "0", ""):
+        extra = []
+    else:
+        extra = [m.strip() for m in env.split(",") if m.strip()]
+    seen = {model}
+    chain = [model]
+    for m in extra:                        # dedupe, keep the given order
+        if m and m not in seen:
+            seen.add(m)
+            chain.append(m)
+    if not _chain_announced[0] and len(chain) > 1:
+        _chain_announced[0] = True
+        print(f"[gemini] model chain: {' -> '.join(chain)} "
+              f"(a spent/absent model falls through to the next one)")
+    return chain
+
+
+_chain_announced = [False]
+
+
+def _body_of(e) -> str:
+    """The HTTP error body text (the exception stays readable for other
+    readers: _post_adaptive restores it with io.BytesIO)."""
+    try:
+        return e.read().decode("utf-8", "replace")
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def _post_rotating(pool, key: str, model: str, payload: dict):
+    """ONE generateContent request, with key rotation: a 429 or a
+    failure that blames the key itself moves to the next key in the
+    pool. Returns (resp, kind, detail): resp is the parsed body on
+    success, otherwise kind is one of
+      exhausted  no usable key left for THIS model today
+      no_model   the API does not serve this model id with this key
+      http       any other HTTP failure (already reported)
+      network    the request never reached the API (already reported)
+    `exhausted` and `no_model` are deliberately NOT reported here —
+    they are the model chain's business (_call): one spent model must
+    not sink the run while a sibling model still answers."""
+    rot = 0
+    while True:
         try:
-            k = pool.acquire() if pool is not None else key
-            resp = _post(API.format(model=model), payload, k)
+            k = pool.acquire(model) if pool is not None else key
+            resp = _post_adaptive(API.format(model=model), payload, k, model)
             if pool is not None:
-                pool.note_call()
+                pool.note_call(model)
+            return resp, "", ""
         except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8", "replace")
-            except Exception:              # noqa: BLE001
-                body = ""
+            body = _body_of(e)
             if pool is not None and e.code == 429 and rot < len(pool.keys):
-                pool.note_429(body)
+                pool.note_429(body, model)
                 rot += 1
                 continue
             if pool is not None and rot < len(pool.keys) \
                     and _key_fault(e.code, body):
-                pool.note_bad_key(e.code, body)   # next key may serve
+                pool.note_bad_key(e.code, body, model)  # next key may serve
                 rot += 1
                 continue
+            low = (body or "").lower()
+            if (e.code == 404 or "not found" in low
+                    or "no longer available" in low):
+                return None, "no_model", _http_detail_text(e.code, body)
+            if e.code == 429 and ("perday" in low or "per day" in low
+                                  or "requests per day" in low):
+                # this MODEL's daily bucket is spent; the quota is per
+                # model, so the next model in the chain has its own
+                return None, "exhausted", _http_detail_text(e.code, body)
             report_error(f"{model} call failed",
-                         _http_detail_text(e.code, body), _hint_for(e.code))
-            return None
+                         _http_detail_text(e.code, body),
+                         _hint_for(e.code, body))
+            return None, "http", _http_detail_text(e.code, body)
         except keypool.PoolExhausted as e:
-            report_error(f"{model} pool exhausted", str(e),
-                         "no usable key left (daily caps spent, keys "
-                         "rejected, or every key cooling down) — "
-                         "deterministic output for now")
-            return None
-        except Exception as e:   # network dead: det output
+            return None, "exhausted", str(e)
+        except Exception as e:                 # network dead: det output
             report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
                          "network unreachable from this host?")
-            return None
+            return None, "network", f"{type(e).__name__}: {e}"
+
+
+def _chain_detail(fails) -> str:
+    """One line naming why every model in the chain failed."""
+    detail = "; ".join(
+        f"{f[0]}: {(f[2] if len(f) > 2 and f[2] else f[1])}"
+        for f in fails) or "no model in chain"
+    if {f[1] for f in fails} == {"exhausted"}:
+        detail = f"pool exhausted for every model in the chain ({detail})"
+    return detail
+
+
+def _chain_hint(fails, kept: str = "deterministic output for now") -> str:
+    """The action line under a chain failure."""
+    if any(f[1] == "no_model" for f in fails):
+        bad = " / ".join(f[0] for f in fails if f[1] == "no_model")
+        return (f"this key cannot see {bad} — fix QBANK_LLM_MODEL / "
+                f"QBANK_LLM_FALLBACK_MODELS (scripts/check_gemini.py lists "
+                f"the ids that DO work)")
+    return ("no usable key left (daily caps spent, keys rejected, or every "
+            f"key cooling down) — {kept}")
+
+
+def _call_model(pool, key: str, model: str, payload: dict,
+                attempts: int = 3):
+    """One model's turn at a call: up to `attempts` shots at a usable
+    answer (a MAX_TOKENS stop doubles the budget and retries).
+    Returns (rows, kind, detail) — kind "" on success."""
+    attempt, kind, detail = 0, "", ""
+    while attempt < attempts:
+        resp, kind, detail = _post_rotating(pool, key, model, payload)
+        if resp is None:
+            return None, kind, detail
         txt, why = _answer_text(resp)
         if txt:
             txt = re.sub(r"^```(?:json)?|```$", "", txt)
@@ -574,12 +826,39 @@ def _call(pool, key: str, model: str, payload: dict):
             except ValueError:
                 rows = None
             if rows is not None:
-                return rows
+                return rows, "", ""
             why = "answer was not the expected JSON"
         report_error(f"{model} no usable answer", why)
+        detail = why
         if "MAX_TOKENS" in why:
             payload = _bump_cap(payload)   # then retry with more room
-        attempt += 1           # RECITATION/SAFETY filters: retry
+        attempt += 1
+        kind = "no_answer"
+    return None, kind, detail
+
+
+def _call(pool, key: str, model: str, payload: dict):
+    """One generateContent exchange with pool-aware key rotation and
+    model fallback. Returns the parsed rows or None — the caller keeps
+    the deterministic output."""
+    chain = _model_chain(model)
+    fails = []
+    for i, m in enumerate(chain):
+        # the primary gets the usual 3 attempts; a fallback gets one,
+        # so a hopeless prompt cannot burn a second model's whole day
+        rows, kind, detail = _call_model(pool, key, m, payload,
+                                         attempts=3 if i == 0 else 1)
+        if rows is not None:
+            if m != model:
+                print(f"[gemini] {model} could not answer "
+                      f"({fails[-1][1] if fails else 'unusable'}) — "
+                      f"{m} answered instead")
+            return rows
+        fails.append((m, kind, detail))
+        if kind not in ("exhausted", "no_model", "no_answer"):
+            return None                    # fatal: already reported
+    report_error(f"{model} call failed", _chain_detail(fails),
+                 _chain_hint(fails))
     return None
 
 
@@ -592,46 +871,66 @@ def list_models(key: str, timeout: int = 30) -> list[dict]:
 
 def check_model(model: str | None = None, pool=None,
                 key: str | None = None) -> bool:
-    """Preflight: does THIS key actually serve THIS model id, through
-    the SAME header auth the calls use? Prints a one-line verdict, and
-    when the model is wrong it lists the ids that WOULD work — so a bad
-    QBANK_LLM_MODEL is caught before an hour-long run instead of during
-    it. Returns True when the model is usable."""
+    """Preflight: is SOME model in the chain usable with this key,
+    through the SAME header auth the calls use? The per-model key state
+    comes first — the daily quota is per MODEL, so a pool can be spent
+    for one model and fine for another (this exact situation shut the
+    Gemini pass off for a whole run). Prints a one-line verdict; when
+    nothing works it lists the ids that WOULD. Returns True when the
+    run can use the model (a fallback counts — it says so)."""
     model = model or os.environ.get("QBANK_LLM_MODEL", DEFAULT_MODEL)
     pool = pool or (None if key else keypool.get_pool())
     key = key or os.environ.get("GEMINI_API_KEY", "")
-    try:
-        k = pool.acquire() if pool is not None else key
-    except Exception as e:                     # noqa: BLE001
-        report_error("no usable key in the pool", f"{type(e).__name__}: {e}")
-        return False
-    if not k:
-        report_error("no API key", "neither GEMINI_API_KEY nor GEMINI_API_KEYS "
-                                   "is set in this environment")
-        return False
-    try:
-        req = urllib.request.Request(f"{MODELS_API}/{model}",
-                                     headers={"x-goog-api-key": k})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            info = json.loads(r.read()) or {}
-        print(f"[gemini] model check OK: {model} "
-              f"({info.get('displayName', '?')})", flush=True)
-        return True
-    except urllib.error.HTTPError as e:
-        report_error("model check failed", _http_detail(e), _hint_for(e.code))
-    except Exception as e:                     # noqa: BLE001
-        report_error("model check failed", f"{type(e).__name__}: {e}",
-                     "the host cannot reach generativelanguage.googleapis.com")
-        return False
-    try:                        # wrong model id: say what WOULD work
-        avail = sorted(m["name"].split("/")[-1] for m in list_models(k)
-                       if "generateContent" in
-                       (m.get("supportedGenerationMethods") or []))
-        print("[gemini]   models this key can use: "
-              + ", ".join(avail[:12]) + (" ..." if len(avail) > 12 else ""),
-              flush=True)
-    except Exception:                          # noqa: BLE001
-        pass
+    chain = _model_chain(model)
+    for m in chain:
+        if pool is not None:
+            try:
+                k = pool.acquire(m)
+            except keypool.PoolExhausted as e:
+                report_error(f"no key available for {m}",
+                             f"{type(e).__name__}: {e}",
+                             "its daily quota is spent (the free-tier cap is "
+                             "per MODEL) — another model in the chain may "
+                             "still serve")
+                continue
+        else:
+            k = key
+        if not k:
+            report_error("no API key",
+                         "neither GEMINI_API_KEY nor GEMINI_API_KEYS is set "
+                         "in this environment")
+            return False
+        try:
+            req = urllib.request.Request(f"{MODELS_API}/{m}",
+                                         headers={"x-goog-api-key": k})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                info = json.loads(r.read()) or {}
+            if m != model:
+                print(f"[gemini] {model} is unusable right now — this run "
+                      f"uses {m} instead", flush=True)
+            print(f"[gemini] model check OK: {m} "
+                  f"({info.get('displayName', '?')})", flush=True)
+            return True
+        except urllib.error.HTTPError as e:
+            report_error("model check failed", _http_detail(e),
+                         _hint_for(e.code))
+        except Exception as e:                 # noqa: BLE001
+            report_error("model check failed", f"{type(e).__name__}: {e}",
+                         "the host cannot reach "
+                         "generativelanguage.googleapis.com")
+            return False
+        try:                        # wrong model id: say what WOULD work
+            avail = sorted(mm["name"].split("/")[-1]
+                           for mm in list_models(k)
+                           if "generateContent" in
+                           (mm.get("supportedGenerationMethods") or []))
+            print("[gemini]   models this key can use: "
+                  + ", ".join(avail[:12])
+                  + (" ..." if len(avail) > 12 else ""), flush=True)
+        except Exception:                          # noqa: BLE001
+            pass
+    print(f"[gemini] no model in the chain passed the check "
+          f"({', '.join(chain)})", flush=True)
     return False
 
 
@@ -804,50 +1103,31 @@ one row per line, every row with the same number of columns:
 
 def _call_text(pool, key: str, model: str, payload: dict) -> str | None:
     """generateContent exchange returning raw text (markdown), with the
-    same pool/retry discipline as _call — plus a LOUD report of every
-    failure and one automatic retry with a bigger budget when the model
-    ran out of output tokens before it finished the table."""
-    rot, attempt = 0, 0
-    while attempt < 3:
-        try:
-            k = pool.acquire() if pool is not None else key
-            resp = _post(API.format(model=model), payload, k)
-            if pool is not None:
-                pool.note_call()
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8", "replace")
-            except Exception:              # noqa: BLE001
-                body = ""
-            if pool is not None and e.code == 429 and rot < len(pool.keys):
-                pool.note_429(body)
-                rot += 1
-                continue
-            if pool is not None and rot < len(pool.keys) \
-                    and _key_fault(e.code, body):
-                pool.note_bad_key(e.code, body)   # next key may serve
-                rot += 1
-                continue
-            report_error(f"{model} call failed",
-                         _http_detail_text(e.code, body), _hint_for(e.code))
-            return None
-        except keypool.PoolExhausted as e:
-            report_error(f"{model} pool exhausted", str(e),
-                         "no usable key left (daily caps spent, keys "
-                         "rejected, or every key cooling down) — "
-                         "deterministic output for now")
-            return None
-        except Exception as e:                 # noqa: BLE001
-            report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
-                         "network unreachable from this host?")
-            return None
-        txt, why = _answer_text(resp)
-        if txt:
-            return re.sub(r"^```(?:markdown)?|```$", "", txt).strip()
-        report_error(f"{model} no usable answer", why)
-        if "MAX_TOKENS" in why:
-            payload = _bump_cap(payload)       # retry with more room
-        attempt += 1
+    same pool/retry discipline as _call plus the model chain — and one
+    automatic retry with a bigger budget when the model ran out of
+    output tokens before it finished the table."""
+    fails = []
+    for i, m in enumerate(_model_chain(model)):
+        attempt, kind, detail = 0, "", ""
+        while attempt < (3 if i == 0 else 1):
+            resp, kind, detail = _post_rotating(pool, key, m, payload)
+            if resp is None:
+                break
+            txt, why = _answer_text(resp)
+            if txt:
+                if m != model:
+                    print(f"[gemini] {model} could not answer — "
+                          f"{m} answered instead")
+                return re.sub(r"^```(?:markdown)?|```$", "", txt).strip()
+            report_error(f"{m} no usable answer", why)
+            if "MAX_TOKENS" in why:
+                payload = _bump_cap(payload)   # retry with more room
+            kind, attempt = "no_answer", attempt + 1
+        fails.append((m, kind, detail if kind != "no_answer" else ""))
+        if kind not in ("exhausted", "no_model", "no_answer"):
+            return None                        # fatal: already reported
+    report_error(f"{model} call failed", _chain_detail(fails),
+                 _chain_hint(fails))
     return None
 
 
@@ -867,13 +1147,23 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
     def refine(book, pgs, current_md: str) -> str | None:
         pgs = [int(p) for p in (pgs if isinstance(pgs, (list, tuple))
                                 else [pgs])] or [1]
+        ask_full = REARRANGE_PROMPT
+        if len(pgs) > 1:
+            ask_full += (f"\n\nThe extraction below covers a table that "
+                         f"spanned {len(pgs)} printed pages: treat it as "
+                         "ONE continuous table — the page break is just "
+                         "another artifact to repair.")
         cache = None
         if cache_dir is not None:
             # R7: the MODEL and the PROMPT are part of the identity — a
             # cached answer from another model (or from an older prompt)
             # must never be served as if it were this one's.
+            # the WHOLE prompt text goes into the key, not a hash of the
+            # static part: the per-table ask (multi-page note, metadata)
+            # changes the question, and a cache that ignores part of the
+            # question can serve an answer to a different one.
             sig = hashlib.sha1(
-                f"R7|{model}|{_fp8(REARRANGE_PROMPT)}|"
+                f"R8|{model}|{ask_full}|"
                 f"{getattr(book.doc, 'name', '')}|{tuple(pgs)}|"
                 f"{hashlib.sha1(current_md.encode()).hexdigest()}"
                 .encode()).hexdigest()
@@ -883,12 +1173,8 @@ def refiner(cache_dir: Path | None = None, model: str | None = None,
                     return json.loads(cache.read_text())
                 except Exception:              # noqa: BLE001
                     pass
-        ask = REARRANGE_PROMPT
-        if len(pgs) > 1:
-            ask += (f"\n\nThe extraction below covers a table that "
-                    f"spanned {len(pgs)} printed pages: treat it as "
-                    "ONE continuous table — the page break is just "
-                    "another artifact to repair.")
+        ask = ask_full
+        _input_size_note(f"rearrange {t_id(current_md)}", ask + current_md)
         payload = {
             "contents": [{"parts": [
                 {"text": ask + "\n\nExtraction:\n" + current_md}]}],
@@ -928,6 +1214,14 @@ AUTHORITY for cell boundaries, characters, numbers, symbols and
 structure; the extraction is the starting point.
 
 Do PRESENTATION REFINEMENT + EXTRACTION-ERROR REPAIR. Nothing else.
+
+THE PRINTED TABLE IS THE AUTHORITY, INCLUDING ITS OWN TYPOS. If the
+crop shows "e.g-" or a missing space after a comma or an odd
+capitalisation, that is what the book prints: keep it exactly. Correct
+only the EXTRACTION's mistakes against the crop — never "improve" the
+source's wording, spelling, punctuation or units. If the extraction
+already says what the crop says, answer NO_CHANGE (this is the common
+case and it is the expected answer for a clean table).
 
 ALLOWED presentation changes (same information, better layout):
 - compact, highly scannable, visually balanced cells; free from
@@ -995,59 +1289,43 @@ def _call_structured(pool, key: str, model: str, payload: dict,
                      counter: dict | None = None):
     """generateContent exchange expecting a JSON OBJECT answer
     ({action, refined_table, changes, table_id}), with the same
-    pool/retry discipline as _call. Returns the parsed dict, or None
-    — the caller keeps the current table. `counter` (a dict with an
-    "n" key) is bumped once per model query actually issued."""
-    rot, attempt = 0, 0
+    pool/retry discipline as _call plus the model chain. Returns the
+    parsed dict, or None — the caller keeps the current table.
+    `counter` (a dict with an "n" key) is bumped once per model query
+    actually issued."""
+    fails = []
     counted = False
-    while attempt < 3:
-        try:
-            k = pool.acquire() if pool is not None else key
-            resp = _post(API.format(model=model), payload, k)
-            if pool is not None:
-                pool.note_call()
+    for i, m in enumerate(_model_chain(model)):
+        attempt, kind, detail = 0, "", ""
+        while attempt < (3 if i == 0 else 1):
+            resp, kind, detail = _post_rotating(pool, key, m, payload)
+            if resp is None:
+                break
             if counter is not None and not counted:
                 counter["n"] = int(counter.get("n", 0)) + 1
                 counted = True
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8", "replace")
-            except Exception:              # noqa: BLE001
-                body = ""
-            if pool is not None and e.code == 429 and rot < len(pool.keys):
-                pool.note_429(body)
-                rot += 1
-                continue
-            if pool is not None and rot < len(pool.keys) \
-                    and _key_fault(e.code, body):
-                pool.note_bad_key(e.code, body)
-                rot += 1
-                continue
-            report_error(f"{model} call failed",
-                         _http_detail_text(e.code, body), _hint_for(e.code))
-            return None
-        except keypool.PoolExhausted as e:
-            report_error(f"{model} pool exhausted", str(e),
-                         "no usable key left — current table kept")
-            return None
-        except Exception as e:                 # noqa: BLE001
-            report_error(f"{model} call failed", f"{type(e).__name__}: {e}",
-                         "network unreachable from this host?")
-            return None
-        txt, why = _answer_text(resp)
-        if txt:
-            txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
-            try:
-                obj = json.loads(txt)
-                if isinstance(obj, dict):
-                    return obj
-                why = "answer JSON was not an object"
-            except ValueError:
-                why = "answer was not valid JSON"
-        report_error(f"{model} no usable answer", why)
-        if "MAX_TOKENS" in why:
-            payload = _bump_cap(payload)       # retry with more room
-        attempt += 1
+            txt, why = _answer_text(resp)
+            if txt:
+                txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
+                try:
+                    obj = json.loads(txt)
+                    if isinstance(obj, dict):
+                        if m != model:
+                            print(f"[gemini] {model} could not answer — "
+                                  f"{m} answered instead")
+                        return obj
+                    why = "answer JSON was not an object"
+                except ValueError:
+                    why = "answer was not valid JSON"
+            report_error(f"{m} no usable answer", why)
+            if "MAX_TOKENS" in why:
+                payload = _bump_cap(payload)   # retry with more room
+            kind, attempt = "no_answer", attempt + 1
+        fails.append((m, kind, detail if kind != "no_answer" else ""))
+        if kind not in ("exhausted", "no_model", "no_answer"):
+            return None                        # fatal: already reported
+    report_error(f"{model} call failed", _chain_detail(fails),
+                 _chain_hint(fails, "current table kept"))
     return None
 
 
@@ -1087,24 +1365,6 @@ def refine_final(cache_dir: Path | None = None, model: str | None = None,
         }
         has_image = book is not None and bool(regions)
         cache = None
-        if cache_dir is not None:
-            # model + prompt + document + regions + content identity
-            reg_key = tuple(str(p) + "|" + str(tuple(round(v, 1) for v in b))
-                            for p, b in regions)
-            doc_name = str(
-                getattr(getattr(book, 'doc', None), 'name', ''))
-            md_hash = hashlib.sha1(
-                (current_md or '').encode()).hexdigest()
-            sig = hashlib.sha1(
-                ("TF1|" + model + "|" + _fp8(REFINE_FINAL_PROMPT) + "|"
-                 + doc_name + "|" + str(tuple(pgs)) + "|"
-                 + str(reg_key) + "|" + md_hash).encode()).hexdigest()
-            cache = cache_dir / f"{sig}.json"
-            if cache.exists():
-                try:
-                    return json.loads(cache.read_text())
-                except Exception:              # noqa: BLE001
-                    pass
         ask = REFINE_FINAL_PROMPT
         if has_image:
             n = min(len(regions), MAX_REFINE_CROPS)
@@ -1131,6 +1391,28 @@ def refine_final(cache_dir: Path | None = None, model: str | None = None,
                     "describes; NEVER a source for table content):\n"
                     + context)
         ask += "\n\nCurrent extraction (pipe-markdown):\n" + current_md
+        if cache_dir is not None:
+            # model + the WHOLE question (static prompt, image note,
+            # cross-page note, metadata, context) + document + regions +
+            # content identity. Any change to what we ASK invalidates
+            # the cached answer; a stale cache can no longer be served.
+            reg_key = tuple(str(p) + "|" + str(tuple(round(v, 1) for v in b))
+                            for p, b in regions)
+            doc_name = str(
+                getattr(getattr(book, 'doc', None), 'name', ''))
+            md_hash = hashlib.sha1(
+                (current_md or '').encode()).hexdigest()
+            ask_hash = hashlib.sha1(ask.encode()).hexdigest()
+            sig = hashlib.sha1(
+                ("TF2|" + model + "|" + _fp8(REFINE_FINAL_PROMPT) + "|"
+                 + ask_hash + "|" + doc_name + "|" + str(tuple(pgs)) + "|"
+                 + str(reg_key) + "|" + md_hash).encode()).hexdigest()
+            cache = cache_dir / f"{sig}.json"
+            if cache.exists():
+                try:
+                    return json.loads(cache.read_text())
+                except Exception:              # noqa: BLE001
+                    pass
         parts = []
         if has_image:
             for pg, box in regions[:MAX_REFINE_CROPS]:
@@ -1145,6 +1427,7 @@ def refine_final(cache_dir: Path | None = None, model: str | None = None,
                         "table crop could not be rendered for Gemini",
                         f"{type(e).__name__}: {e}")
         parts.append({"text": ask})
+        _input_size_note(f"final refine {t.get('table_id')}", ask)
         payload = {
             "contents": [{"parts": parts}],
             "generationConfig": {"temperature": 0.0,

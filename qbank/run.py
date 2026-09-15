@@ -80,6 +80,9 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         book, scan, ch.chapter_no,
         page_range=(ch.file_start, ch.file_end), vocab=vocab, llm=llm,
         verify=verify)
+    stats: dict = {}                 # empty when the pass is off/disabled
+    final_stats: dict = {}
+    final_regression = None
     refine_only = os.environ.get("QBANK_REFINE", "all")
     if refine and refine_only != "off":
         # in-extraction Gemini pass: EVERY extracted table is sent to
@@ -89,7 +92,6 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         from . import refine as refine_mod
         ledger = Path(output_root) / "data" / refine_mod.LEDGER
         memo: dict = {}
-        stats: dict = {}
         for qn, rec in records.items():
             qid = f"{subject}-{ch.chapter_no:03d}-{qn:03d}"
             for t in rec.get("tables") or []:
@@ -104,6 +106,8 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
               f"{stats.get('same', 0)} unchanged, "
               f"{stats.get('empty', 0)} no-answer, "
               f"{stats.get('invalid', 0)} invalid (original kept), "
+              f"{stats.get('content_changed', 0)} rejected for changed "
+              f"content (original kept), "
               f"{stats.get('skip', 0)} skipped")
     # FINAL table refinement (presentation + medically safe repair):
     # `all` (default) sends EVERY table, `flagged` only QA-flagged
@@ -112,8 +116,6 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
     # are still recorded on the ledger row, the safety is unchanged.
     # QBANK_FINAL_REFINE=all | flagged | off
     final_only = os.environ.get("QBANK_FINAL_REFINE", "all")
-    final_stats: dict = {}
-    final_regression = None
     if final_refine and final_only != "off":
         from . import refine_final as final_mod
         fledger = Path(output_root) / "data" / final_mod.LEDGER
@@ -157,6 +159,16 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
     anomalies = list(scan.anomalies) + list(extra_anoms)
     census = _census_summary(scan, anomalies)
 
+    # Only "the call produced NO answer" is a retry trigger: the other
+    # outcomes (invalid shape, content rejected, fidelity rejected) are
+    # deterministic verdicts on an answer that is CACHED, so asking
+    # Gemini again would return the same bytes and the same verdict —
+    # they are recorded for the audit, not retried.
+    llm_fail = {
+        "rearrange_no_answer": stats.get("empty", 0),
+        "final_no_answer": final_stats.get("empty", 0),
+    } if (refine is not None or final_refine is not None) else {}
+
     structured_ids = {t["table_id"]
                       for rec in records.values()
                       for t in rec.get("tables") or []
@@ -189,6 +201,7 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
             {**final_stats,
              "regression_ok": final_regression["ok"]}
             if final_regression is not None else None),
+        gemini_stats=stats, llm_failures=llm_fail,
         image_report_summary={
             "claimed": len(img_rep.claims),
             "orphans": len(img_rep.orphans),
@@ -223,6 +236,13 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
     } for c in img_rep.claims]
     append_jsonl(config.DATA_DIR / "image_ownership.jsonl", ledger)
 
+    # ---- LLM completeness of this chapter -------------------------
+    # A deterministic chapter is complete the moment its files are
+    # written. A chapter whose tables were SENT to Gemini and came back
+    # without an answer (or with an answer the validators refused) is
+    # half done: the text is on disk, the model pass is missing. Those
+    # counters travel with the chapter so the next run can retry it
+    # (state.note_llm_failures) instead of resuming past it.
     title = chapter_title(book, ch.file_start, scan, ch.chapter_title)
     dt = time.time() - t0
     return {
@@ -232,6 +252,8 @@ def run_chapter(book: Book, subject: str, ch, store: ImageStore,
         "glyph_fixes": sum(glyph_audit.values()),
         "images": len(img_rep.claims), "orphans": len(img_rep.orphans),
         "secs": round(dt, 1),
+        "gemini": dict(stats), "gemini_final": dict(final_stats),
+        "llm_failures": {k: v for k, v in llm_fail.items() if v},
         "final_refine": ({**final_stats,
                           "regression_ok": final_regression["ok"],
                           "counts": final_regression["counts"]}
@@ -326,9 +348,23 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
         })
         if chapters_filter and ch.chapter_no not in chapters_filter:
             continue
+        failed_before = (prog.get("chapters_llm_failed") or {}).get(
+            chapter_id) or {}
+        retry_failed = os.environ.get("QBANK_RETRY_FAILED", "1") != "0"
         if not force and chapter_id in prog["chapters_done"]:
-            print(f"[{subject}] {chapter_id}: already done (resume)")
-            continue
+            if failed_before and retry_failed:
+                print(f"[{subject}] {chapter_id}: re-running — the last "
+                      f"attempt ended with Gemini failures "
+                      f"{failed_before} (QBANK_RETRY_FAILED=0 keeps them "
+                      f"as they are)")
+            else:
+                if failed_before:
+                    print(f"[{subject}] {chapter_id}: already done "
+                          f"(resume; Gemini failures kept: "
+                          f"{failed_before})")
+                else:
+                    print(f"[{subject}] {chapter_id}: already done (resume)")
+                continue
         res = run_chapter(book, subject, ch, store, output_root, vocab,
                           llm_fn, verify_fn, refine_fn, final_fn)
         results.append(res)
@@ -341,6 +377,13 @@ def run_book(pdf_path: str, subject: str, page_offset="auto",
               f"{res['secs']}s{flag}")
         if chapter_id not in prog["chapters_done"]:
             prog["chapters_done"].append(chapter_id)
+        state_mod.note_llm_failures(state, subject, chapter_id,
+                                    res.get("llm_failures"))
+        if res.get("llm_failures"):
+            print(f"[{subject}] {chapter_id}: Gemini did NOT complete "
+                  f"{sum(res['llm_failures'].values())} table operation(s) "
+                  f"{res['llm_failures']} — the next run retries this "
+                  f"chapter automatically (QBANK_RETRY_FAILED=0 disables)")
         state_mod.save_state(state)
         book.drop_cache()       # next chapter re-parses; RAM stays flat
         import gc

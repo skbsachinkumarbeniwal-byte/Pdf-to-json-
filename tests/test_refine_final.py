@@ -202,16 +202,17 @@ def test_long_cell_formatting(tmp_path):
     assert t["validation"]["final_refine"]["changes"][0]["kind"] \
         == "presentation"
     assert rows[0]["precheck"] == ["long_cell"]
-    # a line break INSIDE a word is a defect: routed to REVIEW, not
-    # silently accepted (the source's words stay intact)
+    # a line break INSIDE a word is a defect the model introduced: it
+    # is REFUSED (fatal), not queued for a human — the source's words
+    # stay intact and the answer is dropped whole
     bad_after = md([["Mechanism"], [long_text[:10] + "<br>"
                                    + long_text[10:]]])
     assert bad_after.replace("<br>", " ") != long_text  # cuts mid-word
     st2, t2, rows2, _ = run_stage(
         table(before), refined(md_text=bad_after), tmp_path, vocab=VOCAB)
-    assert st2 == "review"
+    assert st2 == "rejected"
     assert t2["markdown"] == before           # nothing applied
-    assert "mid_word_break" in rows2[-1]["review_reasons"][0]
+    assert "mid_word_break" in rows2[-1]["reject_reasons"][0]
 
 
 # --------------------------------------------------------------- 7

@@ -34,6 +34,9 @@ from pathlib import Path
 # A per-MINUTE 429 is a burst, not a dead key: park it briefly and
 # keep using the rest of the pool.
 RPM_COOLDOWN_SECONDS = 60
+# a 429 whose body carries no per-day quota id is retried this many
+# times (with a cooldown each time) before the key is called spent
+VAGUE_429_LIMIT = 5
 DEFAULT_MAX_CALLS_PER_DAY = 480
 # The free tier allows 15 requests/minute per project: pace every key
 # at 12 so bursts never trip a 429 (env QBANK_MAX_CALLS_PER_MINUTE
@@ -69,6 +72,24 @@ class PoolExhausted(RuntimeError):
     pass
 
 
+# Gemini's free-tier daily quota is enforced PER PROJECT **AND PER
+# MODEL** ("GenerateRequestsPerDayPerProjectPerModel-FreeTier", 500/day
+# for gemini-3.5-flash-lite at the time of writing). A pool that tracks
+# one bucket per KEY therefore gets it wrong the moment a second model
+# is used (the run's QBANK_LLM_MODEL changes, or a fallback model is
+# tried): the key is marked "spent today" while its bucket for the
+# other model is still full — which is exactly what happened to the
+# Microbiology run, where one model's cap stopped every remaining
+# chapter although another model answered normally one second later.
+# Buckets are therefore keyed (key, model). `model=None` keeps the old
+# single-bucket behaviour for callers that do not care.
+LEGACY_MODEL = "-"
+
+
+def _model_key(model: str | None) -> str:
+    return model or LEGACY_MODEL
+
+
 class KeyPool:
     def __init__(self, keys, max_calls_per_day=DEFAULT_MAX_CALLS_PER_DAY,
                  state_path=None,
@@ -76,19 +97,46 @@ class KeyPool:
         self.keys = list(keys)
         self.max_calls = int(max_calls_per_day)
         self.max_minute = int(max_calls_per_minute)
-        # rolling-60s call stamps per key: pacing state only, in-memory
-        # (a 60 s window is meaningless across processes, so unlike the
-        # daily counters it is never persisted to keypool_state.json)
-        self._min = {f"key{i + 1}": [] for i in range(len(self.keys))}
+        # rolling-60s call stamps per (key, model): pacing state only,
+        # in-memory (a 60 s window is meaningless across processes, so
+        # unlike the daily counters it is not persisted)
+        self._min: dict = {f"key{i + 1}": {} for i in range(len(self.keys))}
         self.state_path = Path(state_path) if state_path else None
         self.day = time.strftime("%Y-%m-%d")
+        self._vague_429: dict = {}       # (key, model) -> vague 429 count
         self.st = {
             f"key{i + 1}": {"fp": _fp(k), "calls": 0, "status": "active",
-                            "cooldown_until": 0}
+                            "cooldown_until": 0, "models": {}}
             for i, k in enumerate(self.keys)
         }
         self.active = 0
         self._load()
+
+    # ---- one key+model bucket ---------------------------------------
+    def _sync(self, idx: int) -> None:
+        """Keep the key-level fields meaningful for readers that only
+        know about a key (the CLI summary, older callers, the tests):
+        the LEGACY bucket IS the key; with real model buckets the key
+        counts as exhausted only when every one of them is."""
+        s = self.st[self.label(idx)]
+        legacy = s["models"].get(LEGACY_MODEL)
+        if legacy is not None:
+            s["status"] = legacy["status"]
+            s["cooldown_until"] = legacy["cooldown_until"]
+            s["calls"] = legacy["calls"]
+            return
+        buckets = list(s["models"].values())
+        if buckets and all(b["status"] == "exhausted" for b in buckets):
+            s["status"] = "exhausted"
+        elif s["status"] == "exhausted":
+            s["status"] = "active"
+
+    def bucket(self, idx: int, model: str | None = None) -> dict:
+        s = self.st[self.label(idx)]
+        mk = _model_key(model)
+        b = s["models"].setdefault(
+            mk, {"calls": 0, "status": "active", "cooldown_until": 0})
+        return b
 
     # ---- persistence ------------------------------------------------
     def _load(self):
@@ -106,6 +154,21 @@ class KeyPool:
             if mine is not None and mine["fp"] == s.get("fp"):
                 mine["calls"] = int(s.get("calls", 0))
                 mine["status"] = s.get("status", "active")
+                mine["cooldown_until"] = float(s.get("cooldown_until", 0))
+                models = s.get("models") or {}
+                for m, b in models.items():
+                    mine["models"][m] = {
+                        "calls": int(b.get("calls", 0)),
+                        "status": b.get("status", "active"),
+                        "cooldown_until": float(b.get("cooldown_until", 0)),
+                    }
+                if not models:
+                    # a state file written before per-model buckets: the
+                    # old numbers describe the key as a whole
+                    mine["models"][LEGACY_MODEL] = {
+                        "calls": int(s.get("calls", 0)),
+                        "status": s.get("status", "active"),
+                        "cooldown_until": float(s.get("cooldown_until", 0))}
         act = saved.get("active", 0)
         self.active = act if isinstance(act, int) and 0 <= act < len(self.keys) else 0
 
@@ -125,91 +188,154 @@ class KeyPool:
             self.day = today
             for s in self.st.values():
                 s.update(calls=0, status="active", cooldown_until=0)
+                s["models"] = {}
+            self._vague_429.clear()
 
     def label(self, idx: int | None = None) -> str:
         return f"key{(self.active if idx is None else idx) + 1}"
 
     # ---- rotation -----------------------------------------------------
-    def _minute_wait(self, idx: int, now: float) -> float:
+    def _minute_wait(self, idx: int, now: float,
+                     model: str | None = None) -> float:
         """Seconds until this key has per-minute room (0 = right now).
-        The rolling 60 s window keeps every key under the API's 15/min
-        rate — the pool waits instead of tripping 429s."""
-        stamps = [t for t in self._min[self.label(idx)] if now - t < 60.0]
-        self._min[self.label(idx)] = stamps
+        The rolling 60 s window keeps every key under the API's
+        requests-per-minute rate — the pool waits instead of tripping
+        429s."""
+        mk = _model_key(model)
+        lab = self.label(idx)
+        stamps = [t for t in self._min.setdefault(lab, {}).get(mk, [])
+                  if now - t < 60.0]
+        self._min[lab][mk] = stamps
         if len(stamps) < self.max_minute:
             return 0.0
         return max(0.0, 60.0 - (now - stamps[0]))
 
-    def acquire(self) -> str:
-        """The current usable key, advancing past exhausted/cooldown
-        keys and preferring one with per-minute room. When every usable
-        key is merely pacing-capped, waits for the window to slide;
-        raises PoolExhausted only when no key can serve at all (daily
-        caps spent or every key cooling down)."""
+    def acquire(self, model: str | None = None) -> str:
+        """The current usable key, advancing past exhausted keys and
+        preferring one with per-minute room.
+
+        A key that tripped a per-minute 429 is COOLING DOWN, not spent:
+        the pool waits for it (up to its cooldown) and continues. That
+        distinction is not cosmetic — with a single-key pool the old
+        code `continue`d over cooling keys, found no wait candidates and
+        raised PoolExhausted, which the caller reports as "all keys
+        spent today" and every remaining table of the book came back
+        "no-answer" for the rest of the run. Three chapters of the real
+        book were degraded exactly that way (~60 s of cooldown each)
+        before this fix. PoolExhausted now means what it says: every key
+        is at its daily cap or rejected by the API."""
         self._rollover()
         while True:
             now = time.time()
             waits = []
+            cooling = []
             for i in range(len(self.keys)):
                 idx = (self.active + i) % len(self.keys)
                 s = self.st[self.label(idx)]
-                if s["status"] == "exhausted":
+                b = self.bucket(idx, model)
+                if _model_key(model) == LEGACY_MODEL:
+                    # no model given -> the fields on the key entry ARE
+                    # the bucket (pre-per-model callers and state files)
+                    b["status"], b["calls"] = s["status"], s["calls"]
+                    b["cooldown_until"] = s["cooldown_until"]
+                if s["status"] == "exhausted" and b["status"] == "exhausted":
+                    continue
+                if b["status"] == "exhausted":
+                    continue
+                if b["calls"] >= self.max_calls:
+                    b["status"] = "exhausted"
+                    self._sync(idx)
+                    print(f"[keypool] {self.label(idx)} (fp {s['fp']}) hit "
+                          f"its {self.max_calls}-call budget for "
+                          f"{_model_key(model)} — advancing")
                     continue
                 if s["status"] == "cooldown" and s["cooldown_until"] > now:
+                    cooling.append(s["cooldown_until"] - now)
                     continue
-                if s["calls"] >= self.max_calls:
-                    s["status"] = "exhausted"
+                if b["status"] == "cooldown" and b["cooldown_until"] > now:
+                    cooling.append(b["cooldown_until"] - now)
                     continue
-                w = self._minute_wait(idx, now)
+                w = self._minute_wait(idx, now, model)
                 if w > 0:
                     waits.append(w)
                     continue
                 self.active = idx
                 return self.keys[idx]
-            if not waits:
+            if not waits and not cooling:
                 raise PoolExhausted(f"all {len(self.keys)} keys spent today")
-            wait = min(waits)
-            print(f"[keypool] pacing cap ({self.max_minute}/min per key) "
-                  f"hit on every usable key — waiting {wait:.1f}s",
-                  flush=True)
+            wait = min(waits + cooling)
+            why = ("rate-limit cooldown" if not waits
+                   else f"pacing cap ({self.max_minute}/min per key)")
+            print(f"[keypool] every usable key is waiting ({why}) — "
+                  f"waiting {wait:.1f}s", flush=True)
+            self._save()
             time.sleep(wait)
 
-    def note_call(self):
+    def note_call(self, model: str | None = None):
         s = self.st[self.label()]
+        b = self.bucket(self.active, model)
+        self._vague_429.pop((s.get("fp", ""), _model_key(model)), None)
         s["calls"] += 1
-        self._min[self.label()].append(time.time())   # pacing window
-        if s["calls"] >= self.max_calls:
-            s["status"] = "exhausted"
-            print(f"[keypool] {self.label()} (fp {s['fp']}) hit daily cap "
-                  f"({self.max_calls}) — advancing")
+        b["calls"] += 1
+        self._min.setdefault(self.label(), {}).setdefault(
+            _model_key(model), []).append(time.time())    # pacing window
+        if b["calls"] >= self.max_calls:
+            b["status"] = "exhausted"
+            print(f"[keypool] {self.label()} (fp {s['fp']}) hit its "
+                  f"{self.max_calls}-call budget for {_model_key(model)} "
+                  f"— advancing")
+        self._sync(self.active)
         self._save()
 
-    def note_429(self, err_text: str = ""):
+    def note_429(self, err_text: str = "", model: str | None = None):
         """Classify a 429 from the Gemini error body: a per-MINUTE quota
         id means a burst — 60 s cooldown, key stays in the pool; a
         per-DAY quota means the bucket is spent — exhaust and advance."""
         s = self.st[self.label()]
+        b = self.bucket(self.active, model)
         low = (err_text or "").lower()
-        per_minute = "perminute" in low or "per minute" in low
-        if per_minute and s["status"] != "exhausted":
-            s["status"] = "cooldown"
-            s["cooldown_until"] = time.time() + RPM_COOLDOWN_SECONDS
-            print(f"[keypool] {self.label()} (fp {s['fp']}) rate-limited "
-                  f"(per-minute) — cooling {RPM_COOLDOWN_SECONDS}s")
-        else:
-            s["status"] = "exhausted"
+        per_day = ("perday" in low or "per day" in low
+                   or "requests per day" in low)
+        if per_day:
+            # THIS model's daily bucket, not the key: another model can
+            # still serve (the message names the model it applies to)
+            b["status"] = "exhausted"
             print(f"[keypool] {self.label()} (fp {s['fp']}) daily quota "
-                  f"exhausted — advancing")
+                  f"exhausted for {_model_key(model)} — advancing "
+                  f"(other models keep their own quota)")
+            self._sync(self.active)
+        else:
+            # everything else (per-minute burst, a vague 429, an unparsed
+            # body) is treated as TRANSIENT: cool the key and keep going.
+            # Killing a key for the day on a message we did not
+            # understand threw away the rest of the book's quota.
+            key_fp = (s.get("fp", ""), _model_key(model))
+            self._vague_429[key_fp] = self._vague_429.get(key_fp, 0) + 1
+            if self._vague_429[key_fp] > VAGUE_429_LIMIT:
+                b["status"] = "exhausted"
+                print(f"[keypool] {self.label()} (fp {s['fp']}) 429 without a "
+                      f"quota id {self._vague_429[key_fp]}x for "
+                      f"{_model_key(model)} — treating as spent for today")
+            else:
+                b["status"] = "cooldown"
+                b["cooldown_until"] = time.time() + RPM_COOLDOWN_SECONDS
+                print(f"[keypool] {self.label()} (fp {s['fp']}) rate-limited "
+                      f"— cooling {RPM_COOLDOWN_SECONDS}s (the pool waits, "
+                      f"it does not give up)")
+        self._sync(self.active)
         self._save()
 
-    def note_bad_key(self, code: int, err_text: str = ""):
+    def note_bad_key(self, code: int, err_text: str = "", model=None):
         """This key was rejected for THIS run (revoked key, quota 403,
         per-project block): park it and advance — the next key in the
         pool may still serve."""
         s = self.st[self.label()]
         s["status"] = "exhausted"
+        b = self.bucket(self.active, model)
+        b["status"] = "exhausted"
         print(f"[keypool] {self.label()} (fp {s['fp']}) rejected by the "
               f"API (HTTP {code}) — advancing to the next key")
+        self._sync(self.active)
         self._save()
 
     # ---- reporting -----------------------------------------------------

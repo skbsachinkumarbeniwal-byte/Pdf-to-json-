@@ -142,6 +142,21 @@ def cmd_table_audit(args) -> int:
     print(f"  before_after_regression: "
           f"{'OK' if reg.get('ok') else 'FAILED'} "
           f"({reg.get('chapters', 0)} chapter(s), {reg.get('counts', {})})")
+    rej = res.get("rejected_changes") or []
+    if rej:
+        print(f"  REFUSED model suggestions ({len(rej)}) — the printed "
+              f"table was kept:")
+        for c in rej[: args.limit]:
+            if c.get("kind") == "review":
+                print(f"    {c['table_id']} REVIEW for a human: "
+                      f"{c.get('reason')}")
+                continue
+            print(f"    {c['table_id']} {c['cell']}: {c.get('before')!r} -> "
+                  f"{c.get('after')!r} [{c.get('kind')}] "
+                  f"verdict={c.get('verdict')} "
+                  f"why={c.get('reject_reasons')}")
+        if len(rej) > args.limit:
+            print(f"    ... and {len(rej) - args.limit} more")
     corr = res.get("corrections") or []
     if corr:
         print(f"  accepted content corrections ({len(corr)}):")
