@@ -177,7 +177,17 @@ def build_final_zip(output_root, subject: str, dest=None) -> dict:
         "images_shipped": len(referenced),
         "review_decisions": len(review.load_decisions(out_root)),
         "human_edits": review.edit_count(out_root),
-        "tables_refined": refine_mod.refined_count(out_root, subject),
+        # NAMED FOR ITS STAGE. The external forensic audit found the old
+        # name (`tables_refined`) ambiguous: this counter is the
+        # EXTRACTION-time rearrange ledger, while
+        # table_refinement.tables_refined counts what the FINAL stage
+        # accepted. Two stages, two numbers (23 vs 16 on the MIC run),
+        # identical names — hence the rename.
+        "tables_rearranged_by_gemini": refine_mod.refined_count(out_root,
+                                                                subject),
+        "table_refinement_scope": ("final stage only; extraction-stage "
+                                   "rearrangements are counted in "
+                                   "tables_rearranged_by_gemini"),
         "table_refinement": table_refinement,
         "census_failed_chapters": census_bad,
         "unresolved_qids": unresolved,

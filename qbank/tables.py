@@ -43,6 +43,10 @@ from .llm import merge_llm
 _CAMEL = re.compile(r"(?<=[a-z]{2})(?=[A-Z][a-z])")
 _LONG_TOKEN = re.compile(r"[A-Za-z]{12,}")
 _ALPHA = re.compile(r"[A-Za-z]+")
+# printed token that MIXES letters and digits (CD4, STAT3, UL97, NOD1,
+# SA14-14-2). The leading letter is required so pure numbers stay out:
+# a bare "58" is a number, not a medical token.
+_ALNUM = re.compile(r"[A-Za-z][A-Za-z0-9+\-]*")
 
 
 def build_vocab(book) -> tuple:
@@ -61,6 +65,10 @@ def build_vocab(book) -> tuple:
     from .textlayer import word_rows
     words: Counter = Counter()
     pairs: Counter = Counter()
+    # ALPHANUMERIC tokens are a SECOND vocabulary. _ALPHA is letters-only,
+    # so before this Counter existed a printed `CD4` left no evidence
+    # anywhere and the medical-token repair had nothing to stand on.
+    mixed: Counter = Counter()
     for pg in range(1, book.total_pages + 1):
         for wr in word_rows(book.page(pg)):
             # strip edge punctuation first: "count," / "none." are the
@@ -72,8 +80,13 @@ def build_vocab(book) -> tuple:
                 words[t.lower()] += 1
             for a, b in zip(toks, toks[1:]):
                 pairs[(a.lower(), b.lower())] += 1
+            for w in wr:
+                m = _ALNUM.fullmatch(w.text.strip(".,;:!?()[]{}\"'"))
+                if m is not None and any(ch.isdigit() for ch in m.group(0)):
+                    mixed[m.group(0).lower()] += 1
     try:
         book._qbank_vocab = (words, pairs)      # reuse across phases
+        book._qbank_mixed = mixed
     except Exception:                           # noqa: BLE001
         pass                                    # read-only book: recompute
     return words, pairs
@@ -122,7 +135,7 @@ _FUNC = frozenset({"the", "not", "of", "a", "an", "in", "on", "at", "is",
 _ORD_TAIL = r"(?:st|nd|rd|th)"
 
 
-def spacing_fix(text: str) -> str:
+def spacing_fix(text: str, mixed=None) -> str:
     """Deterministic spacing fixes for the glue shapes the text layer
     leaves behind (reviewer-directed; purely shape-based, no vocab):
 
@@ -182,6 +195,10 @@ def spacing_fix(text: str) -> str:
     # accidental multiple spaces collapse to one (prose only in
     # practice: table cells arrive here as single-space tokens)
     out = re.sub(r" {2,}", " ", out)
+    # medical-token joins LAST: the repairs above only move spaces
+    # around, and this one needs the book's alphanumeric vocabulary
+    if mixed:
+        out, _joins = join_medical_tokens(out, mixed)
     return out
 
 
@@ -544,10 +561,115 @@ class BoxTable:
     camel_fixes: int = 0
     vocab_fixes: int = 0
     punct_fixes: int = 0          # space around , ; : ( ) quotes repaired
+    med_token_fixes: int = 0      # split medical tokens rejoined (C D4->CD4)
     llm_fixes: int = 0
     verify_calls: int = 0
     verify_clear: bool = False
     warnings: list = field(default_factory=list)
+
+
+def alnum_vocab(book):
+    """Counter of printed ALPHANUMERIC tokens (lowercased) — the evidence
+    pool for join_medical_tokens. Shares build_vocab's single page scan;
+    a book whose word vocab was never built gets it built here."""
+    cached = getattr(book, "_qbank_mixed", None)
+    if cached is not None:
+        return cached
+    try:
+        build_vocab(book)
+    except Exception:                           # noqa: BLE001
+        return Counter()
+    return getattr(book, "_qbank_mixed", None) or Counter()
+
+
+# --- medical-token joins ----------------------------------------------
+# The ED8 text layer sometimes leaves a space INSIDE an alphanumeric
+# token: the printed `CD4+` arrives as `C D4+`, `STAT3` as `STA T3`,
+# `UL97` as `U L97`. This is not a presentation choice — a reader
+# searching the output for `CD4` misses the row — so it is repaired
+# deterministically, on every text-bearing field (stem, options,
+# solution, table cells), exactly as the forensic audit required.
+#
+# The candidate shape is deliberately narrow: the SECOND piece must
+# contain a digit. That single requirement is what keeps ordinary
+# English out of the pass — `brain stem`, `T cell`, `B cell`,
+# `bone marrow`, `red blood cell` can never match, so their joined forms
+# are never even proposed.
+# Second piece: starts with an UPPERCASE letter or a digit and contains
+# a digit. Requiring the uppercase/digit start is what refuses `C d4`
+# (a lowercase tail is not the split shape the extractor produces), and
+# requiring a digit is what refuses ordinary English — the two guards
+# together are why `brain stem` / `T cell` / `bone marrow` can never be
+# candidates.
+_MED_JOIN = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{0,5})\s+"
+    r"((?:[A-Z][A-Za-z0-9+\-]*|[0-9][A-Za-z0-9+\-]*)\d?"
+    r"[A-Za-z0-9+\-]*)(?![A-Za-z0-9])")
+# ...and a WRAPPED NUMBER (`OX 1 9` in a narrow table column: the
+# printed `OX 19` broke after the first digit). Three pieces, all merged
+# at once and gated on the full form, so only a printed `OX19` joins.
+_MED_JOIN_NUM = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{0,5})\s+(\d{1,3})\s+(\d{1,3})(?![0-9])")
+# ...and a three-piece LETTER split (`N O D1`, the shape the audit
+# named) would be unreachable through the plain rule, because the
+# intermediate `OD1` has no evidence of its own. This pattern merges all
+# three at once, and is still gated on the FULL form: only a printed
+# `NOD1` joins.
+_MED_JOIN3 = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z])\s+([A-Z])\s+"
+    r"((?:[A-Z][A-Za-z0-9+\-]*|[0-9][A-Za-z0-9+\-]*)\d?"
+    r"[A-Za-z0-9+\-]*)(?![A-Za-z0-9])")
+
+
+def join_medical_tokens(text: str, mixed=None) -> tuple:
+    """(repaired text, [(before, after), ...]) — joins a split medical
+    token ONLY where the book itself prints the joined form.
+
+    The forensic audit was explicit that the detector regex is a
+    CANDIDATE GENERATOR and must never be run blindly: joining every
+    uppercase/number pair would rewrite `A 5-year-old` into
+    `A5-year-old`. Evidence comes from `mixed`, the book's own
+    alphanumeric vocabulary, so the pass can only restore a form the
+    book prints somewhere.
+
+    Fidelity contract: only WHITESPACE may change. The result with all
+    whitespace removed is identical to the input's, character for
+    character — nothing is added, dropped, substituted or spell-fixed.
+    """
+    if not text or mixed is None or not mixed:
+        return text, []
+    before = re.sub(r"\s+", "", text)
+    out = text
+    repairs: list = []
+    for _ in range(6):                  # fixed point: N O D1 -> NOD1
+        def _sub(m):
+            joined = m.group(1) + m.group(2)
+            if not any(ch.isdigit() for ch in joined):
+                return m.group(0)           # first guard: digits required
+            if joined.lower() in mixed:     # second guard: book evidence
+                repairs.append((m.group(0), joined))
+                return joined
+            return m.group(0)
+
+        def _sub3(m):
+            joined = m.group(1) + m.group(2) + m.group(3)
+            if not any(ch.isdigit() for ch in joined):
+                return m.group(0)
+            if joined.lower() in mixed:
+                repairs.append((m.group(0), joined))
+                return joined
+            return m.group(0)
+
+        new = _MED_JOIN_NUM.sub(_sub3, _MED_JOIN3.sub(_sub3,
+                                                        _MED_JOIN.sub(_sub, out)))
+        if new == out:
+            break
+        out = new
+    if repairs and re.sub(r"\s+", "", out) != before:
+        raise AssertionError(                       # safety net
+            "join_medical_tokens changed content, not just spacing: "
+            f"{before[:60]!r} -> {re.sub(r'\\s+', '', out)[:60]!r}")
+    return out, repairs
 
 
 def _join_decision(prev, nxt, fill_x1, fill_reaches_edge, vocab=None) -> str:
@@ -664,7 +786,12 @@ def qa_suspects(matrix: list, words, pairs=None) -> list:
     qa: list = []
     for r in matrix:
         for c in r:
-            toks = re.findall(r"[A-Za-z]{2,}", str(c))
+            # a HYPHEN is a printed separator, not a lost space:
+            # tokenising "re-assortment" as "re"+"assortment" made the
+            # fragment "assortment" look like the tail of a wrapped word
+            # (the book prints "reassortment" elsewhere) and raised a
+            # REVIEW on the real book's 025-T01, which locks the gate
+            toks = re.findall(r"[A-Za-z]{2,}(?:-[A-Za-z]{2,})*", str(c))
             for a, b in zip(toks, toks[1:]):
                 al, bl = a.lower(), b.lower()
                 if al in _FUNC and bl in _FUNC:
@@ -687,8 +814,11 @@ def qa_suspects(matrix: list, words, pairs=None) -> list:
                 if w.get(lo, 0) >= 2 or t[0].isupper() or lo in _FUNC \
                         or lo in _LEGIT:
                     continue
-                if len(lo) >= 16 and w.get(lo, 0) == 0:
-                    qa.append(t)                    # (d)
+                if len(lo) >= 16 and w.get(lo, 0) == 0 and "-" not in lo:
+                    # (d) a glued multi-word blob. A HYPHEN is printed
+                    # structure, not glue: "cell-independent" is 16
+                    # characters and perfectly legitimate.
+                    qa.append(t)
                 elif len(lo) >= 3 and _split2(lo):
                     qa.append(t)                    # (c) two-way split
                 elif len(lo) >= 6 and _func_glue(lo):
@@ -734,6 +864,11 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
                 return ("r", i)
         # outside row rules or no row rules: per-baseline fallback
         return ("y", round(ycen / 3.0))
+
+    # the book's alphanumeric vocabulary (CD4, STAT3, ...): evidence for
+    # the medical-token joins below. Memoised on the book, so this is a
+    # dict lookup in every box after the first.
+    mixed = alnum_vocab(book) if book is not None else None
 
     # measured fill edge per column (typesetter's text extent)
     fill = [0.0] * ncols
@@ -801,6 +936,10 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
                         bt.vocab_fixes += 1
                 t, npf = punct_spacing(t)
                 bt.punct_fixes += npf
+                if mixed:
+                    t, joins = join_medical_tokens(t, mixed)
+                    if joins:
+                        bt.med_token_fixes += len(joins)
                 t = glyphs.repair(t, counts)
                 for tok in long_space_suspects(
                         t, vocab[0] if vocab is not None else None):

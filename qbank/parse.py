@@ -21,7 +21,7 @@ from collections import Counter
 from . import glyphs
 from .config import (GRADE_RESOLVED, GRADE_RESOLVED_ANCHORED, PROV_TEXT_LAYER,
                      QA_INCOMPLETE, QA_READY, QA_REVIEW_NEEDED)
-from .tables import ChapterTables, spacing_fix
+from .tables import ChapterTables, alnum_vocab, spacing_fix
 from .textlayer import Book, Line, reflow
 from .zones import ChapterScan
 
@@ -170,7 +170,9 @@ def build_chapter_records(book: Book, scan: ChapterScan,
                 table_regions[(qn, "Q")] = q_regions
             stem_lines, opts_raw, markers = _split_stem_options(body)
             option_markers[qn] = markers
-            stem = spacing_fix(glyphs.repair(reflow(stem_lines), counts))
+            mixed = (alnum_vocab(book) if book is not None else None)
+            stem = spacing_fix(glyphs.repair(reflow(stem_lines), counts),
+                               mixed)
             rec["question_text"] = stem
             for letter in "abcd":
                 raw = opts_raw.get(letter)
@@ -181,10 +183,12 @@ def build_chapter_records(book: Book, scan: ChapterScan,
                     (seed if isinstance(item, str) else rest).append(item)
                 text = " ".join(seed) if seed else ""
                 if rest:
-                    tail = spacing_fix(glyphs.repair(reflow(rest), counts))
+                    tail = spacing_fix(glyphs.repair(reflow(rest), counts),
+                                       mixed)
                     text = (text + " " + tail).strip() if text else tail
                 rec["options"][letter.upper()] = \
-                    spacing_fix(glyphs.repair(text, counts)) if text else text
+                    spacing_fix(glyphs.repair(text, counts), mixed) \
+                    if text else text
             for ln in body:
                 rec["source_pages"].add(ln.page)
             rec["source_pages"].add(rec["q_header_page"])
@@ -202,10 +206,16 @@ def build_chapter_records(book: Book, scan: ChapterScan,
             sol_lines, s_tables, s_regions = _extract_tables(
                 book, sol_lines, ctables, counts)
             rec["tables"].extend(s_tables)
+            # the solution block produced these tables: a table-only
+            # solution is then faithful extraction, not a missing field
+            # (see _solution_is_a_table). Private to the parse record —
+            # writer.build_rows serialises an explicit field list, so it
+            # never reaches the output.
+            rec["_sol_tables"] = [t["table_id"] for t in s_tables]
             if s_regions:
                 table_regions[(qn, "SOL")] = s_regions
             rec["solution_text"] = spacing_fix(
-                glyphs.repair(reflow(sol_lines), counts))
+                glyphs.repair(reflow(sol_lines), counts), mixed)
             for ln in sol_lines:
                 rec["source_pages"].add(ln.page)
             rec["source_pages"].add(rec["s_header_page"])
@@ -229,6 +239,42 @@ def build_chapter_records(book: Book, scan: ChapterScan,
             anomalies, ctables.stats())
 
 
+def _solution_is_a_table(rec: dict) -> bool:
+    """True when the printed solution for this question IS a table.
+
+    Several ED8 solutions are table-only: `Solution to Question 22:`
+    followed immediately by a grid, with no prose at all (MIC-034-022,
+    source pages 600-601). An empty `solution_text` is then FAITHFUL
+    extraction, not a missing field — the forensic audit of the
+    main-branch output flagged exactly this as a QA/schema-rule bug.
+
+    Evidence is the parse pass itself, not a guess: the solution block's
+    own lines produced a table. (A page test is not enough — the grid can
+    start on the page AFTER the `Solution to Question N:` header, which
+    is exactly what MIC-034-022 does: header on 600, grid on 601.)
+    """
+    return bool(rec.get("_sol_tables"))
+
+
+def _match_items_missing(rec: dict) -> bool:
+    """True when a `Match the following` stem has no items to match.
+
+    THIS BOOK prints two of them that way (MIC-030-006 on p490,
+    MIC-034-022 on p586): the stem, then the combination options A-D,
+    with the numbered/lettered lists never printed. The extraction is
+    faithful — the gap is in the book. The question is still unanswerable
+    as printed, so it is reported for a human rather than shipped as
+    READY in silence. (Question-level reasons do not lock the export
+    gate; only table REVIEWs do.)"""
+    stem = rec.get("question_text") or ""
+    if not re.search(r"match the following", stem, re.I):
+        return False
+    if len(re.findall(r"(?:^|\s)\d\s*[.)]\s", stem)) >= 2:
+        return False                    # the items are printed inline
+    sol = set(rec.get("_sol_tables") or [])
+    return not [t for t in rec["tables"] if t.get("table_id") not in sol]
+
+
 def grade_and_status(rec: dict) -> tuple[str, str, list[str]]:
     """(q_id_grade, qa_status, qa_reasons) — deterministic.
 
@@ -249,12 +295,14 @@ def grade_and_status(rec: dict) -> tuple[str, str, list[str]]:
         missing.append("options")
     if not rec["correct_option"]:
         missing.append("correct_option")
-    if not rec["solution_text"].strip():
+    if not rec["solution_text"].strip() and not _solution_is_a_table(rec):
         missing.append("solution_text")
 
     reasons = [f for f in rec["flags"] if f != "unknown_glyph"]
     if "unknown_glyph" in rec["flags"]:
         reasons.append("unknown_glyph")
+    if _match_items_missing(rec):
+        reasons.append("source_missing_match_items")
     if missing:
         return grade, QA_INCOMPLETE, reasons + [f"missing:{m}" for m in missing]
     if reasons:
