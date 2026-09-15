@@ -621,3 +621,60 @@ def test_a_wrap_artifact_join_is_allowed_even_though_both_parts_print():
         "| T | Diethylcarbamazine and prednisolone |\n|---|---|\n",
         (words, pairs))
     assert ok is True
+
+
+# --------------------------------------------------- mark placement
+# The rearrange pass may move cells around and drop the separators the
+# typesetter ran into the text, but a MARK (".", "-", "/") must sit where
+# the print puts it. Live corruption this pins: the printed "Madurella
+# griseaE jeanselmei" was rearranged into "Madurella grisea" + "E.
+# jeanselmei" — one dot out, one in, so the count-free signature saw an
+# unchanged multiset and the invented period shipped, where the verifier
+# (which keeps "." as evidence) failed the very cell it came from.
+
+_CELL_TABLE = ("| Mycetoma | Pseudallescheria boydii (Anamorph Scedosporium "
+               "apiospermum).Madurella mycetomatis Madurella griseaE "
+               "jeanselmei Acremonium falciforme |\n"
+               "|---|---|\n| X | y |\n")
+
+
+def test_a_moved_period_is_refused():
+    moved = ("| Mycetoma | • Pseudallescheria boydii (Anamorph Scedosporium "
+             "apiospermum)<br>• Madurella mycetomatis<br>• Madurella grisea"
+             "<br>• E. jeanselmei<br>• Acreonium falciforme |\n"
+             "|---|---|\n| X | y |\n").replace("Acreonium", "Acremonium")
+    ok, diff = refine_mod.same_content(_CELL_TABLE, moved)
+    assert ok is False
+    assert ". after 'E'" in diff["summary"]          # the invented "E."
+
+
+def test_a_dropped_separator_and_bullets_are_allowed():
+    """The same rearrangement without inventing a mark: the printed
+    separator "." disappears into <br> bullets, the rows are reordered,
+    and the letters are untouched — that is the pass's own job."""
+    rearranged = ("| X | y |\n|---|---|\n| Mycetoma | • Pseudallescheria "
+                  "boydii (Anamorph Scedosporium apiospermum)<br>• Madurella "
+                  "mycetomatis<br>• Madurella griseaE jeanselmei<br>• "
+                  "Acremonium falciforme |\n")
+    assert refine_mod.same_content(_CELL_TABLE, rearranged)[0] is True
+
+
+def test_an_invented_hyphen_is_refused():
+    hyphen = _CELL_TABLE.replace("apiospermum).Madurella",
+                                 "apiospermum)-Madurella")
+    ok, diff = refine_mod.same_content(_CELL_TABLE, hyphen)
+    assert ok is False and "mark moved/added" in diff["summary"]
+
+
+def test_a_respaced_dash_stays_legal():
+    """Re-spacing around an existing dash must not start failing: the
+    mark still sits on the same letter run."""
+    before = "| T | 10-20 years |\n|---|---|\n| a | b |\n"
+    after = "| T | 10 - 20 years |\n|---|---|\n| a | b |\n"
+    assert refine_mod.same_content(before, after)[0] is True
+
+
+def test_a_case_only_change_is_still_reported_not_refused():
+    shouted = _CELL_TABLE.replace("Madurella", "MADURELLA")
+    ok, diff = refine_mod.same_content(_CELL_TABLE, shouted)
+    assert ok is True and diff["case_only"] is True

@@ -84,6 +84,15 @@ _BR = re.compile(r"</?[Bb][Rr]\s*/?>")
 # before this the missing space made the validator call a correct
 # spacing repair a `deletion` and throw it away.
 _SEP = re.compile(r"[;,]\s*")
+# The book's OTHER list separator: the typesetter ran a period straight
+# into the next item ("…apiospermum).Madurella mycetomatis", "…, B.
+# cereus.Clostridium"). It is presentation exactly like "; " / ", ", so
+# it is folded on BOTH sides — a refinement that turns it into <br>
+# bullets is restructuring, not deleting a printed character. Guarded to
+# the run-in shape ("), ." + Capital), so abbreviation periods ("S.
+# aureus"), decimals, and a "." the model invents at a word's end
+# ("E. jeanselmei") all stay content.
+_SEP_DOT = re.compile(r"(?<=[)\w])\.(?=\s*[A-Z])")
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 
@@ -198,6 +207,7 @@ def display_text(text: str) -> str:
     t = (text or "").translate(_CHAR_EQUIV)
     t = _BR.sub(" ", t)
     t = _SEP.sub(" ", t)
+    t = _SEP_DOT.sub(" ", t)
     t = _BULLET_CHAR.sub(" ", t)
     t = _BULLET_DASH.sub(" ", t)
     return re.sub(r"\s+", " ", t).strip()
@@ -349,8 +359,45 @@ def _letters_chars(text: str) -> str:
     return re.sub(r"\s+", "", re.sub(_NUM, " ", display_text(text)))
 
 
-def _cell_change(bc: str, ac: str, words, page_nums,
-                 mch: dict | None) -> dict | None:
+def _mark_keys(text: str) -> Counter:
+    """Multiset of (letter the mark hangs on, mark) for every
+    verifier-visible mark (".", "-", "/") of a cell.
+
+    The same rule the rearrange envelope uses (refine._punct_keys): a
+    separator the typesetter ran into the text may be DROPPED, but a
+    mark must not MOVE to another word. Counting alone cannot see a
+    move — "…apiospermum). Madurella … grisea E jeanselmei" rewritten as
+    "… grisea<br>• E. jeanselmei" takes one period out and puts one in —
+    so the move was classified `reorder` (a REVIEW) and locked the
+    export gate on a table whose text was perfectly faithful.
+
+    One letter of context is deliberate: the pass re-segments words
+    ("antibodyp-ANCA" -> "antibody p-ANCA"), which changes a longer
+    context but never the letter the mark sits on."""
+    out: Counter = Counter()
+    tail = ""
+    for ch in display_text(text):
+        if ch.isalnum():
+            tail = ch
+        elif ch.isspace():
+            continue
+        elif ch in "./-":
+            out[(tail, ch)] += 1
+        else:
+            tail = ""
+    return out
+
+
+def _marks_moved(before: str, after: str) -> list:
+    """Marks `after` carries that `before` does not, i.e. marks that
+    appeared on a different word (readable form for the report)."""
+    return [f"{ch} on {tail!r}" if tail else ch
+            for (tail, ch), n in (_mark_keys(after)
+                                  - _mark_keys(before)).items()
+            for _ in range(n)]
+
+
+def _cell_change(bc: str, ac: str, words, page_nums, mch: dict | None) -> dict | None:
     """Compare ONE cell pair. None = untouched; otherwise a change
     record, optionally with a 'fatal' fidelity violation.
 
@@ -423,6 +470,13 @@ def _cell_change(bc: str, ac: str, words, page_nums,
     lb, la = _letters_chars(b), _letters_chars(a)
     if lb != la:
         if Counter(lb) == Counter(la):
+            moved = _marks_moved(b, a)
+            if moved:
+                # same characters, but a mark ended up on another word:
+                # not a reorder, and not presentation either — content
+                return {**base, "kind": "mark_moved",
+                        "fatal": "mark_moved",
+                        "detail": {"marks": moved[:6]}}
             return {**base, "kind": "reorder"}
         clb, cla = Counter(lb), Counter(la)
         added_l, removed_l = list((cla - clb).elements()), \

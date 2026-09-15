@@ -90,6 +90,38 @@ _SEPARATOR_CHARS = " \t\n\r\f\v-\u2010\u2011\u2012\u2013\u2014_*`\u2022\u00b7|"
 
 _NUMTOK = re.compile(r"\d+(?:[.,]\d+)*")
 
+# every dash the book/typesetter mixes up folds to one character, so a
+# model that re-types "–" as "-" has not changed content
+_DASH = str.maketrans({c: "-" for c in
+                       "‐‑‒–—―−"})
+
+
+# the same tag shape the verifier erases ("<br>", "<b>", "</i>") —
+# the tags go BEFORE the signature stream, or their letters ("br")
+# would count as content and every line break the model adds would
+# read as a rejection
+_TAG = re.compile(r"<[A-Za-z/][^>]{0,12}>")
+
+
+def _table_body(md: str) -> str:
+    """The table's cell text as ONE string: pipes and the |---|---|
+    separator row are markdown syntax, not content, so they are dropped
+    before any character judgement (their hyphens would otherwise read
+    as invented punctuation)."""
+    rows = []
+    lines = [l for l in (md or "").strip().splitlines() if l.strip()]
+    for i, l in enumerate(lines):
+        if i == 1 and re.fullmatch(r"[\s|:\-]+", l.strip()):
+            continue                       # the |---|---| separator row
+        rows.append(l.strip().strip("|"))
+    return " ".join(rows)
+
+
+def _content_text(text: str) -> str:
+    """A cell/table's text with tags and dashes normalised: the form
+    every character-level helper below shares."""
+    return _TAG.sub(" ", _table_body(text)).translate(_DASH)
+
 
 def content_signature(md: str, casefold: bool = False) -> tuple:
     """(letter/digit stream, multiset of numeric tokens) of a pipe table.
@@ -99,15 +131,18 @@ def content_signature(md: str, casefold: bool = False) -> tuple:
     removed — so line breaks, bullets, hyphens, list separators and
     spacing are all presentation. Row/column ORDER is deliberately not
     part of the signature: reordering is what the pass is for."""
-    rows = []
-    lines = [l for l in (md or "").strip().splitlines() if l.strip()]
-    for i, l in enumerate(lines):
-        core = l.strip().strip("|")
-        if i == 1 and re.fullmatch(r"[\s|:\-]+", l.strip()):
-            continue                       # the |---|---| separator row
-        rows.append(core)
-    body = " ".join(rows)
-    stream = re.sub(r"[^0-9A-Za-z]", "", body)
+    body = _table_body(md)
+    # WHICH punctuation is "presentation"? Exactly the set the verifier's
+    # cell check erases (<br>/tags, ";", ",", bullets) — everything else
+    # is print evidence there, so it must be evidence here too. Live
+    # corruption this closes: the printed "Madurella griseaE jeanselmei"
+    # was rearranged into "Madurella grisea" + "E. jeanselmei". The old
+    # signature dropped every non-alphanumeric, so the ADDED period was
+    # invisible, the rearrangement was accepted, and the shipped cell
+    # then failed scripts/verify_extraction.py (it keeps "." and "-").
+    # Dash variants are folded first: the book mixes hyphen/en-dash and
+    # a model writing "-" for "–" is re-spacing, not changing content.
+    stream = re.sub(r"[^0-9A-Za-z.\-/]", "", _content_text(md))
     if casefold:
         stream = stream.lower()
     # a MULTISET (sorted) of characters, not a sequence: moving a cell
@@ -366,31 +401,112 @@ def envelope_mode() -> str:
             or "strict").strip().lower()
 
 
+def _alnum_sorted(text: str) -> str:
+    """Letters and digits only, as a SORTED multiset — the signature
+    minus its punctuation, i.e. the stream that may never change
+    whatever happens to separators (row/cell order carries no meaning
+    here: rearranging is what the pass is for)."""
+    return "".join(sorted(re.sub(r"[^0-9A-Za-z]", "",
+                                 _content_text(text))))
+
+
+_PUNCT_KEEP = "./-"
+# a mark is judged by the single letter it hangs on: enough to catch a
+# mark that MOVED to another word, and immune to the legitimate
+# re-segmentation the pass performs ("antibodyp-ANCA" -> "antibody
+# p-ANCA" keeps "p" before the dash; a whole-run key did not)
+
+
+def _punct_keys(text: str) -> Counter:
+    """Multiset of (last 4 alphanumeric characters before it, mark) for
+    every verifier-visible mark (".", "-", "/") in a cell.
+
+    Why positions and not just counts: the model may DROP a separator
+    the typesetter ran into the text (".Madurella" -> "<br>• Madurella")
+    but must not INVENT a mark. Counting alone cannot tell an invention
+    from a MOVE — the live case moved the printed period of
+    "apiospermum)." onto "grisea" ("Madurella griseaE jeanselmei" ->
+    "Madurella grisea" + "E. jeanselmei"): one dot out, one dot in, so
+    the counts matched and the invented "E." shipped and then failed
+    scripts/verify_extraction.py. Judging each mark by the letter run it
+    sits on makes a move an addition, and it stays order-insensitive, so
+    reordered rows/cells are still fine."""
+    out: Counter = Counter()
+    tail = ""
+    for ch in _content_text(text):
+        if ch.isalnum():
+            tail = ch
+        elif ch.isspace():
+            continue                 # "10 - 20" is the same run as "10-20"
+        elif ch in _PUNCT_KEEP:
+            out[(tail, ch)] += 1
+        else:
+            tail = ""                # "…apiospermum)." sits on ")", not
+            #                          on a letter run — and the invented
+            #                          "E." that motivated this rule sits
+            #                          on "E", so the two cannot be confused
+    return out
+
+
+def _punct_added(before: str, after: str) -> list:
+    """Marks `after` carries that `before` does not (moved or invented),
+    as a readable list for the rejection message."""
+    return [f"{ch} after {tail!r}" if tail else ch
+            for (tail, ch), n in (_punct_keys(after)
+                                  - _punct_keys(before)).items()
+            for _ in range(n)]
+
+
 def same_content(before: str, after: str, words=None) -> tuple:
     """(True, diff) when the model only moved/re-spaced the table;
     (False, diff) when a letter or digit changed — or when `words` (the
     book vocabulary) shows the answer split/joined a word the printed
     book separates the other way. `off` short-circuits this to True
-    (see envelope_mode)."""
+    (see envelope_mode).
+
+    Three things are content, in this order:
+      1. the letters/digits (order-insensitive: reordering is the job);
+      2. the numeric tokens;
+      3. every verifier-visible mark (".", "-", "/") AT THE LETTER RUN IT
+         SITS ON. A separator the typesetter ran into the text may be
+         DROPPED — ".Madurella" -> "<br>Madurella" is normal — but a mark
+         must never appear where the print has none, which is exactly the
+         live corruption this closes: the printed "Madurella griseaE
+         jeanselmei" was rearranged into "Madurella grisea" + "E.
+         jeanselmei". One dot out, one dot in: the old count-free
+         signature saw an unchanged multiset, accepted it, and the
+         shipped cell then failed scripts/verify_extraction.py.
+    """
     if envelope_mode() in ("off", "0", "none"):
         return True, {}
     sb, nb = content_signature(before)
     sa, na = content_signature(after)
-    if (sb, nb) == (sa, na):
-        weak, how = segmentation_weakens(before, after, words) \
-            if words is not None else (False, "")
-        if weak:
-            diff = signature_diff(before, after)
-            diff["segmentation"] = how
+    same_sig = (sb, nb) == (sa, na)
+    diff = None if same_sig else signature_diff(before, after)
+    added = _punct_added(before, after)
+    letters_ok = (nb == na
+                  and _alnum_sorted(before) == _alnum_sorted(after))
+    if diff is not None and diff["case_only"] and not added:
+        return True, diff                    # capitalisation only
+    if added or not letters_ok:
+        diff = diff if diff is not None else signature_diff(before, after)
+        if added:
             diff["summary"] = (f"{diff.get('summary') or ''}"
                                f"{'; ' if diff.get('summary') else ''}"
-                               f"segmentation={how}")
-            return False, diff
-        return True, {}
-    diff = signature_diff(before, after)
-    if diff["case_only"] and nb == na:
-        return True, diff                    # capitalisation only
-    return False, diff
+                               f"mark moved/added="
+                               f"{', '.join(added[:4])}")
+            diff["punctuation"] = added
+        return False, diff
+    weak, how = segmentation_weakens(before, after, words) \
+        if words is not None else (False, "")
+    if weak:
+        diff = diff if diff is not None else signature_diff(before, after)
+        diff["segmentation"] = how
+        diff["summary"] = (f"{diff.get('summary') or ''}"
+                           f"{'; ' if diff.get('summary') else ''}"
+                           f"segmentation={how}")
+        return False, diff
+    return True, {}
 
 
 def flagged(t: dict) -> bool:

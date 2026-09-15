@@ -41,6 +41,12 @@ from .llm import merge_llm
 # camel boundary: >=2 lowercase, then an uppercase that starts a
 # lowercase run. Never splits pH / IgG / mOsm / B12 / VLDL.
 _CAMEL = re.compile(r"(?<=[a-z]{2})(?=[A-Z][a-z])")
+
+# a token ending in ONE capital after a lowercase run: the capital opens a
+# new item ("griseaE" -> "grisea E"). The capital must be followed by a
+# non-letter, or established lowercase-prefix acronyms ("cccDNA",
+# "dsDNA", "ssRNA" — capital RUNS) would be torn apart.
+_CAMEL_TAIL = re.compile(r"(?<=[a-z]{3})(?=[A-Z](?![A-Za-z]))")
 _LONG_TOKEN = re.compile(r"[A-Za-z]{12,}")
 _ALPHA = re.compile(r"[A-Za-z]+")
 # printed token that MIXES letters and digits (CD4, STAT3, UL97, NOD1,
@@ -69,6 +75,7 @@ def build_vocab(book) -> tuple:
     # so before this Counter existed a printed `CD4` left no evidence
     # anywhere and the medical-token repair had nothing to stand on.
     mixed: Counter = Counter()
+    items: Counter = Counter()                 # camel-boundary sub-runs
     for pg in range(1, book.total_pages + 1):
         for wr in word_rows(book.page(pg)):
             # strip edge punctuation first: "count," / "none." are the
@@ -84,9 +91,23 @@ def build_vocab(book) -> tuple:
                 m = _ALNUM.fullmatch(w.text.strip(".,;:!?()[]{}\"'"))
                 if m is not None and any(ch.isdigit() for ch in m.group(0)):
                     mixed[m.group(0).lower()] += 1
+                # CAMEL SUB-ITEMS: this book glues list items and species
+                # names together ("richardsiaeBipolaris", "coliCryptospo",
+                # "aCladophialophora"). A capital inside a printed token
+                # therefore marks a printed ITEM START, and the sub-run
+                # (`Bipolaris`) is a whole printed item even though the
+                # vocabulary has no standalone occurrence of it.
+                a = w.text.strip(".,;:!?()[]{}\"'")
+                if re.fullmatch(r"[A-Za-z]{4,}", a) and re.search(r"[a-z][A-Z]", a):
+                    pieces = re.split(r"(?<=[a-z])(?=[A-Z])", a)
+                    if len(pieces) > 1:
+                        for piece in pieces:
+                            if len(piece) >= 3:
+                                items[piece.lower()] += 1
     try:
         book._qbank_vocab = (words, pairs)      # reuse across phases
         book._qbank_mixed = mixed
+        book._qbank_items = items
     except Exception:                           # noqa: BLE001
         pass                                    # read-only book: recompute
     return words, pairs
@@ -202,7 +223,8 @@ def spacing_fix(text: str, mixed=None) -> str:
     return out
 
 
-def _repair_token(tok: str, words: Counter, pairs: Counter) -> tuple:
+def _repair_token(tok: str, words: Counter, pairs: Counter,
+                  whole: set | None = None) -> tuple:
     """Publisher misprints inside ONE token, repaired only with
     book-internal evidence:
 
@@ -210,7 +232,13 @@ def _repair_token(tok: str, words: Counter, pairs: Counter) -> tuple:
                                 are printed words, glued form is not)
       "Increasedpulmonary" -> "Increased pulmonary" (two common words,
                                 glued form never/rarely printed, spaced
-                                phrase printed elsewhere)"""
+                                phrase printed elsewhere)
+
+    `whole` is the set of forms that must NOT be split: tokens the join
+    pass built from the printed geometry, and camel sub-items the book
+    prints (see camel_items). Splitting those undoes the print."""
+    if whole and tok.lower() in whole:
+        return tok, 0
     m = re.fullmatch(r"([A-Za-z]{3,}),([A-Za-z]{3,})", tok)
     if (m and words.get(m.group(1).lower(), 0) >= 1
             and words.get(m.group(2).lower(), 0) >= 1
@@ -237,7 +265,8 @@ def _repair_token(tok: str, words: Counter, pairs: Counter) -> tuple:
 _DIGIT_FRAG = re.compile(r"\d")
 
 
-def _repair_tokens(parts: list, words: Counter, pairs: Counter) -> tuple:
+def _repair_tokens(parts: list, words: Counter, pairs: Counter,
+                   whole: set | None = None) -> tuple:
     """Token-stream repair for one cell line (see _repair_token), plus:
 
       "o fcancer" -> "of cancer"  (short non-word fragment whose head
@@ -255,6 +284,15 @@ def _repair_tokens(parts: list, words: Counter, pairs: Counter) -> tuple:
     i = 0
     while i < len(parts):
         tok = parts[i]
+        # a form the print proves whole (a glued seam or a camel sub-item)
+        # is never split: "Bipolaris" is a printed ITEM that only happens
+        # to be glued to the species before it, and splitting it into
+        # "Bipolar is" corrupted a correct word.
+        m = re.fullmatch(r"[A-Za-z]+", tok or "")
+        if whole and m and tok.lower() in whole:
+            res.append(tok)
+            i += 1
+            continue
         m = re.fullmatch(r"([A-Za-z]{3,})([:;])([A-Za-z]{3,})", tok)
         if (m and words.get(tok.lower(), 0) == 0
                 and words.get(m.group(1).lower(), 0) >= 2
@@ -290,7 +328,7 @@ def _repair_tokens(parts: list, words: Counter, pairs: Counter) -> tuple:
         while core and core[-1] in ",.;:!?)]":
             punct = core[-1] + punct
             core = core[:-1]
-        fixed, nf = _repair_token(core, words, pairs)
+        fixed, nf = _repair_token(core, words, pairs, whole)
         # function word glued onto a common word, printed <=2x
         # ("oftouch" -> "of touch", "tomotor" -> "to motor",
         # "ofinternal" -> "of internal"): both survivors are strongly
@@ -408,7 +446,16 @@ def _repair_tokens(parts: list, words: Counter, pairs: Counter) -> tuple:
             while nxt and nxt[-1] in ",.;:!?)]":
                 npunct = nxt[-1] + npunct
                 nxt = nxt[:-1]
-            if core.isalpha() and nxt.isalpha() and len(nxt) >= 1:
+            # A CAMEL BOUNDARY IS PRINTED EVIDENCE OF A WORD START and
+            # the vocab join must not undo the camel split that already
+            # ran. Without this, `belli Micr` (from `Isospora belliMicr`
+            # in the organism list) was re-glued to `belliMicr` because
+            # the book "prints" that string TWICE — both times as the
+            # same line-wrap artifact on p497 and p563. A broken line
+            # printed twice is not a printed word.
+            camel = (core[-1:].islower() and len(nxt) >= 2
+                     and nxt[0].isupper() and nxt[1].islower())
+            if core.isalpha() and nxt.isalpha() and len(nxt) >= 1 and not camel:
                 jn = (core + nxt).lower()
                 wa, wb = words.get(core.lower(), 0), words.get(nxt.lower(), 0)
                 jj = words.get(jn, 0)
@@ -582,6 +629,22 @@ def alnum_vocab(book):
     return getattr(book, "_qbank_mixed", None) or Counter()
 
 
+def camel_items(book):
+    """Counter of printed ITEM forms that only ever appear glued inside a
+    longer token or wrapped across a line ("Bipolaris" only exists as
+    `richardsiaeBipolaris`; "Phaeohyphomycosi" + "s"). Splitting one of
+    these is undoing the print's own structure, so the vocab repair must
+    leave them whole."""
+    cached = getattr(book, "_qbank_items", None)
+    if cached is not None:
+        return cached
+    try:
+        build_vocab(book)
+    except Exception:                           # noqa: BLE001
+        return Counter()
+    return getattr(book, "_qbank_items", None) or Counter()
+
+
 # --- medical-token joins ----------------------------------------------
 # The ED8 text layer sometimes leaves a space INSIDE an alphanumeric
 # token: the printed `CD4+` arrives as `C D4+`, `STAT3` as `STA T3`,
@@ -698,12 +761,32 @@ def _join_decision(prev, nxt, fill_x1, fill_reaches_edge, vocab=None) -> str:
         a, b = t.split()[-1], n.split()[0]
         ca, cb = words.get(a.lower(), 0), words.get(b.lower(), 0)
         combo = words.get((a + b).lower(), 0)
-        if a.isalpha() and b.isalpha() and combo >= 2:
+        # same invariant as _repair_tokens: a capital letter inside a run
+        # is a word start, so a "printed" glue across that boundary is a
+        # broken line, not a word
+        # ... and a SINGLE CAPITAL is an initial, i.e. a new list item,
+        # never a wrap fragment: this book's organism/species lists are
+        # printed as `... grisea` / `E. jeanselmei`, and gluing there
+        # produced `Madurella griseaE jeanselmei` (the same broken line
+        # twice made `griseae` look printed).
+        single_initial = len(b) == 1 and b.isupper()
+        if (a.isalpha() and b.isalpha() and combo >= 2
+                and not single_initial
+                and not (a[-1:].islower() and len(b) >= 2
+                         and b[0].isupper() and b[1].islower())):
             if combo >= ca and combo >= cb and min(ca, cb) <= 2:
                 return "glue"
             if (len(a) == 1 or len(b) == 1) and min(ca, cb) <= 2:
                 return "glue"
-    flush = fill_reaches_edge and prev.x1 >= fill_x1 - 2.5
+    # Tolerance MEASURED on this book (615 pages, every ruled box):
+    # line pairs whose gap to the column's fill edge falls in 2.5-5.0 pt
+    # are 66 for 66 MID-WORD WRAPS ("sulfur-containi|ng",
+    # "pres|ent", "he|matogenous", "Poxviru|s", "belliMicr|osporidia"),
+    # while the next bucket (5-8 pt, 10 pairs) is already mixed — it
+    # holds real word boundaries such as "cells|monoclonally". Those are
+    # left to the vocabulary path, which needs the joined form to be a
+    # printed word, so 5.0 pt is the widest cut that is still evidence.
+    flush = fill_reaches_edge and prev.x1 >= fill_x1 - 5.0
     if not flush:
         return "space"
     if t[-1] == "," and n[0].isdigit():
@@ -869,6 +952,7 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
     # the medical-token joins below. Memoised on the book, so this is a
     # dict lookup in every box after the first.
     mixed = alnum_vocab(book) if book is not None else None
+    items = camel_items(book) if book is not None else None
 
     # measured fill edge per column (typesetter's text extent)
     fill = [0.0] * ncols
@@ -885,6 +969,7 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
 
     cells = {}          # (bandkey, col) -> text
     band_order = []     # unique bandkeys in visual order
+    seam = set()        # tokens built by a glue join (must stay whole)
     for c, lns in percol.items():
         cur_band, cur, prev_line = None, None, None
         for l in lns:
@@ -903,8 +988,14 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
             if how == "space":
                 cur = cur + " " + txt
             else:
+                # the seam form is PRINTED WHOLE: the geometry says the
+                # typesetter ran out of room and continued the word, so
+                # the vocab repair must not cut it back apart later
+                # (`aquaspersa`, `Phaeohyphomycosis` were both re-split
+                # into `aquaspers a` / `Phaeohypho mycosis`)
                 cur = cur + txt
                 bt.line_joins += 1
+                seam.add(cur.split()[-1].lower())
             cells[(bk, c)] = cur
             prev_line = l
     band_order.sort(key=lambda bk: (bk[0] != "r", bk[1]))
@@ -916,16 +1007,41 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
         for c in range(ncols):
             t = cells.get((bk, c), "")
             if t:
+                before_toks = set(t.split())
                 fixed, n = _CAMEL.subn(" ", t)
                 if n:
                     bt.camel_fixes += n
                     t = fixed
+                # ...and a token that ENDS in one capital after a
+                # lowercase run is the same print evidence: the capital
+                # starts a new item ("Madurella griseaE jeanselmei" is
+                # "… grisea" + "E jeanselmei"). Book-wide this pattern
+                # matches exactly one token, and the established
+                # lowercase-prefix acronyms ("cccDNA", "dsDNA", "ssRNA")
+                # keep a CAPITAL RUN after the prefix, so they are never
+                # touched. The split is registered in `seam` before the
+                # vocab repair, so it cannot be re-glued either.
+                if _CAMEL_TAIL.search(t):
+                    t, n2 = _CAMEL_TAIL.subn(" ", t)
+                    bt.camel_fixes += n2
+                # a camel split is print evidence in itself: the pieces
+                # are printed ITEMS, so protect them from the vocab
+                # repair too ("aquaspersaCladophialophora" -> "aquaspersa
+                # Cladophialophora", where the repair then cut
+                # "aquaspersa" into "aquaspers a")
+                seam.update(w.lower() for w in t.split()
+                            if w not in before_toks)
                 if vocab is not None:
+                    # fixed point: chained glues ("theinfrat...") peel                if vocab is not None:
                     # fixed point: chained glues ("theinfrat...") peel
                     # one repair per pass
+                    whole = None
+                    if seam or items:
+                        whole = set(seam)
+                        whole |= {w for w in items}
                     for _ in range(6):
                         fixed_parts, nf = _repair_tokens(
-                            t.split(" "), vocab[0], vocab[1])
+                            t.split(" "), vocab[0], vocab[1], whole)
                         bt.vocab_fixes += nf
                         t = " ".join(fixed_parts)
                         if not nf:

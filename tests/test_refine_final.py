@@ -824,3 +824,46 @@ def test_render_qa_finding_reported(tmp_path):
     assert "unreadably_wide_cell" in rows[0]["render_qa_before"]
     assert "unreadably_wide_cell" in rows[0]["render_qa_after"]
     assert F.render_qa(md([["A"], ["short"]])) == []
+
+
+# ------------------------------------------- separator periods vs marks
+# Live case (028-T02/T03): the printed "…apiospermum). Madurella … grisea
+# E jeanselmei" was refined into bullets with "E. jeanselmei". The run-in
+# separator period is presentation and may be dropped, but the period the
+# model PUT on "E" is not printed anywhere: the extraction keeps deciding
+# characters, and the verifier checks them.
+_REF_BEFORE = ("Pseudallescheria boydii (Anamorph Scedosporium apiospermum)"
+               ". Madurella mycetomatis Madurella grisea E jeanselmei "
+               "Acremonium falciforme")
+_REF_BULLETS = ("• Pseudallescheria boydii (Anamorph Scedosporium "
+                "apiospermum)<br>• Madurella mycetomatis<br>• Madurella "
+                "grisea<br>• E jeanselmei<br>• Acremonium falciforme")
+
+
+def test_a_separator_period_may_become_bullets():
+    rec = F._cell_change(_REF_BEFORE, _REF_BULLETS, None, None, None)
+    assert rec is not None and rec["kind"] == "presentation"
+    assert rec.get("fatal") is None
+
+
+def test_a_period_moved_onto_another_word_is_fatal():
+    rec = F._cell_change(_REF_BEFORE, _REF_BULLETS.replace("E jeanselmei",
+                                                          "E. jeanselmei"),
+                         None, None, None)
+    assert rec is not None and rec.get("fatal"), rec
+    assert rec["kind"] in ("mark_moved", "hallucinated_addition")
+
+
+def test_an_abbreviation_period_is_still_content():
+    rec = F._cell_change("Staphylococcus aureus and S. epidermidis",
+                         "Staphylococcus aureus and S epidermidis",
+                         None, None, None)
+    assert rec is not None and rec.get("fatal") == "deletion", rec
+
+
+def test_a_period_the_marks_rule_sees_when_it_moves():
+    """Same characters, different word: a plain multiset check called
+    this a `reorder` (a REVIEW that locked the export gate)."""
+    rec = F._cell_change("Staph. aureus", "Staph aureus .", None, None, None)
+    assert rec is not None
+    assert rec.get("fatal") or rec["kind"] == "reorder"

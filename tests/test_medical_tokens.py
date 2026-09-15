@@ -28,6 +28,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from qbank import tables as tables_mod  # noqa: E402
 from qbank.tables import join_medical_tokens  # noqa: E402
 
 # the forms the audit confirmed against the printed page
@@ -304,3 +305,89 @@ def test_match_question_with_inline_items_is_fine():
     _g, status, reasons = grade_and_status(rec)
     assert "source_missing_match_items" not in reasons
     assert status == "READY"
+
+
+# ---------------- word boundaries: camel rule vs the vocab join
+
+def test_camel_boundary_beats_a_vocab_join():
+    """`Isospora belliMicr` (p497/p563, the SAME broken line printed
+    twice) made `belliMicr` look like a printed word (count 2), so the
+    vocab repair re-glued `belli Micr` after the camel rule had split it.
+    A capital inside a run is a word start; a broken line printed twice
+    is not a printed word."""
+    from collections import Counter as C
+    from qbank.tables import _repair_tokens
+    words = C({"belli": 2, "bellimicr": 2, "isospora": 3, "osporidia": 2})
+    parts, n = _repair_tokens(["Isospora", "belli", "Micr"], words, C())
+    assert parts == ["Isospora", "belli", "Micr"], parts
+    assert n == 0
+
+
+def test_lowercase_wrap_still_joins():
+    """The guard must not disable ordinary fragment joining."""
+    from collections import Counter as C
+    from qbank.tables import _repair_tokens
+    words = C({"tissues": 25, "tiss": 1, "ues": 1})
+    parts, n = _repair_tokens(["tiss", "ues"], words, C())
+    assert parts == ["tissues"], parts
+    assert n == 1
+
+
+def test_wrap_join_is_refused_across_a_camel_boundary():
+    """Same invariant on the line-join path: a gluing that would put a
+    capital inside a run is refused even when the book prints the string
+    (it prints it as the broken line)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from collections import Counter as C
+    from qbank import tables as T
+    words = C({"bellimicr": 2, "Microsporidia".lower(): 0})
+    vocab = (words, C())
+
+    class L:
+        def __init__(self, text_, x1):
+            self.text, self.x1 = text_, x1
+
+    # prev ends the printed line, next starts the fragment
+    assert T._join_decision(L("Isospora belli", 295.0), L("Micr", 299.0),
+                            299.0, True, vocab) == "space"
+    # and the ordinary case is untouched
+    assert T._join_decision(L("Trichomonas vagina", 299.0), L("lis", 299.0),
+                            299.0, True, vocab) == "glue"
+
+
+def test_single_capital_initial_is_never_glued():
+    """`... Madurella grisea` + `E. jeanselmei` (the printed organism
+    list) glued to `griseaE` because the broken line appears twice, so
+    `griseae` looked like a printed word. A lone capital is an initial:
+    it starts a new list item."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from collections import Counter as C
+    from qbank import tables as T
+
+    class L:
+        def __init__(self, text_, x1):
+            self.text, self.x1 = text_, x1
+
+    words = C({"griseae": 2, "e": 81})
+    assert T._join_decision(L("Madurella grisea", 296.0), L("E. jeanselmei", 299.0),
+                            299.0, True, (words, C())) == "space"
+    # a normal one-letter CONTINUATION (lowercase) still glues
+    assert T._join_decision(L("Trichomonas vagina", 299.0), L("lis", 299.0),
+                            299.0, True, (words, C())) == "glue"
+
+
+def test_a_trailing_capital_splits_a_glued_item():
+    """A capital that ends a token after a lowercase run is the print's
+    own list separator, exactly like a camel boundary: the book's
+    "Madurella griseaE jeanselmei" is "… grisea" + "E jeanselmei".
+    Book-wide this pattern matches ONE token, so the rule is safe to
+    apply — and it must not touch the established lowercase-prefix
+    acronyms, whose capital is a RUN, not a single letter."""
+    assert tables_mod._CAMEL_TAIL.sub(" ", "griseaE jeanselmei") == \
+        "grisea E jeanselmei"
+    for keep in ("cccDNA", "dsDNA", "ssRNA", "ELISA", "IgM", "BACTEC"):
+        assert tables_mod._CAMEL_TAIL.sub(" ", keep) == keep
