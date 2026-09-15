@@ -37,14 +37,20 @@ RPM_COOLDOWN_SECONDS = 60
 # a 429 whose body carries no per-day quota id is retried this many
 # times (with a cooldown each time) before the key is called spent
 VAGUE_429_LIMIT = 5
+# 480 against the free tier's 500/day, so a run always finishes its
+# budget before the hard wall and the shortfall is discovered by the
+# pool, not by a chapter full of 429s.
 DEFAULT_MAX_CALLS_PER_DAY = 480
-# The free tier allows 15 requests/minute per project per model. Pace
-# every key at 13 — two below the ceiling, so a burst never trips a
-# 429 while the pool still uses most of the allowance (env
-# QBANK_MAX_CALLS_PER_MINUTE overrides). The window is per (key,
-# model): N keys sustain N x 13 requests/minute on the primary model,
-# and the same again on the fallback model, because the API meters
-# each model separately.
+# Requests-per-minute, PER (KEY, MODEL). Published free-tier ceilings
+# for the flash-lite models vary between 15 and 30 RPM depending on
+# model and account age, so pace at 13: measured live on this account,
+# 16 calls in a 31 s window all returned 200, which puts the real
+# ceiling above 16 — 13 sits under every published figure, so a burst
+# cannot trip a 429 while the pool still uses most of the allowance.
+# The window is per (key, model): N keys sustain N x 13 requests/minute
+# on the primary model, and the same again on the fallback, because the
+# API meters each model separately. QBANK_MAX_CALLS_PER_MINUTE
+# overrides.
 DEFAULT_MAX_CALLS_PER_MINUTE = 13
 
 
