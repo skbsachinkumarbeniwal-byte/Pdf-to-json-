@@ -299,3 +299,4 @@ def test_envelope_accepts_model_unglue_of_rare_artifact(ana):
     model = [["extends the whole of the medulla oblongata till the 2nd"]]
     out, n = merge_llm(det, model, ana[1])
     assert n == 1 and out[0][0] == model[0][0]
+

@@ -55,7 +55,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from .audit import load_page_text, num_tokens
+from .audit import load_page_text, num_tokens, page_num_evidence
 from .refine import (flagged as qa_flagged, restore_split_words,
                      salvage_table, segmentation_weakens)
 from .tables import qa_suspects
@@ -683,7 +683,7 @@ def _page_number_evidence(page_text: dict | None, pages: list) -> set | None:
     for p in pages:
         for pp in (p - 1, p, p + 1):
             txt = page_text.get(pp, page_text.get(str(pp), ""))
-            ev |= num_tokens(txt)
+            ev |= page_num_evidence(txt)
     return ev
 
 

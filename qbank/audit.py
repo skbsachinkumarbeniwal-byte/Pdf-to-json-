@@ -34,13 +34,42 @@ _NUM_RE = re.compile(r"\d[\d,\.]*")
 
 def num_tokens(text: str) -> set:
     """Numeric tokens, normalised (comma grouping stripped, trailing
-    separators dropped): '1,000' == '1000', '5.' == '5'."""
+    separators dropped): '1,000' == '1000', '5.' == '5'.
+
+    A comma-SEPARATED list is normalised too: the book prints
+    "(18,19) (B)" and the pipeline's punctuation pass ships the same
+    list as "(18, 19)" — a whitespace-only difference that used to
+    tokenise as one number on the print's side ("1819") and two on
+    ours ("18","19"), so the audit called a faithful cell a
+    `numeric_drift` (ANA-020-004 / 020-T01, the Brodmann table).
+    Closing the space after a comma between digits normalises BOTH
+    sides (the digits themselves are still compared exactly)."""
+    text = re.sub(r"(?<=\d),\s+(?=\d)", ",", text or "")
     out = set()
-    for m in _NUM_RE.findall(text or ""):
+    for m in _NUM_RE.findall(text):
         v = m.replace(",", "").rstrip(".,")
         if v:
             out.add(v)
     return out
+
+
+def page_num_evidence(text: str) -> set:
+    """Numeric evidence of ONE page of raw text layer: the plain tokens
+    PLUS the tokens of the same text with digit runs re-joined across a
+    whitespace break.
+
+    The print wraps numbers mid-token inside narrow columns — p366
+    (ANA) really reads `Visual associationarea (1` / `8,19) (B)`, one
+    printed number "18,19" split over two lines. The extraction joins
+    the wrap (that is the pipeline's job), so the shipped cell carries
+    "18,19" while the raw evidence only had "1" and "819": a faithful
+    cell was flagged `numeric_drift`. Joining digit runs that are
+    adjacent across whitespace restores the printed number without
+    ever comparing LETTERS, and the digits themselves are still
+    compared exactly."""
+    ev = num_tokens(text)
+    ev |= num_tokens(re.sub(r"(?<=\d)\s+(?=\d)", "", text or ""))
+    return ev
 
 
 def _norm_text(t: str) -> str:
@@ -125,7 +154,7 @@ def audit_book(output_root: Path, subject: str | None = None) -> dict:
                         return
                     ev = set()
                     for p in pages:
-                        ev |= num_tokens(page_text.get(p, ""))
+                        ev |= page_num_evidence(page_text.get(p, ""))
                     for v in sorted(num_tokens(text) - ev):
                         flags.append({
                             "kind": "numeric_drift", "severity": "REVIEW",
@@ -147,7 +176,7 @@ def audit_book(output_root: Path, subject: str | None = None) -> dict:
                     if page_text is not None:
                         ev = set()
                         for p in sp:
-                            ev |= num_tokens(page_text.get(p, ""))
+                            ev |= page_num_evidence(page_text.get(p, ""))
                         for v in sorted(num_tokens(sol.get("solution_text", "")) - ev):
                             flags.append({
                                 "kind": "numeric_drift", "severity": "REVIEW",

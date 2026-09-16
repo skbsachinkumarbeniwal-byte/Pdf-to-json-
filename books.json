@@ -1,3 +1,10 @@
 {
-  "MIC": {"path": "pdfs/Microbiology_ed8_CLEAN_corrected.pdf", "page_offset": "auto"}
+  "MIC": {
+    "path": "pdfs/Microbiology_ed8_CLEAN_corrected.pdf",
+    "page_offset": "auto"
+  },
+  "ANA": {
+    "path": "pdfs/Anatomy_ed8_MARROW.pdf",
+    "page_offset": "auto"
+  }
 }

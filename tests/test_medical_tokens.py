@@ -391,3 +391,91 @@ def test_a_trailing_capital_splits_a_glued_item():
         "grisea E jeanselmei"
     for keep in ("cccDNA", "dsDNA", "ssRNA", "ELISA", "IgM", "BACTEC"):
         assert tables_mod._CAMEL_TAIL.sub(" ", keep) == keep
+
+
+def test_a_once_printed_glue_is_not_wrap_evidence():
+    """ANA p366/p590: "Sensorylanguage" and "Bilateraljugulodigastric"
+    each print exactly ONCE — they are the typesetter's dropped space,
+    not a mid-word wrap, so the words they hid ("language",
+    "jugulodigastric") must not be flagged as fragments. Two REVIEWs
+    from exactly this locked the Anatomy export gate."""
+    from qbank.tables import qa_suspects
+    words = Counter({"sensorylanguage": 1, "bilateraljugulodigastric": 1,
+                     "sensory": 9, "bilateral": 24, "and": 900,
+                     "jugulo": 3, "omohyoid": 4, "submandibular": 7})
+    assert qa_suspects([["Sensory language area"]], words, Counter()) == []
+    assert qa_suspects([["Bilateral jugulodigastric and jugulo-omohyoid nodes"]],
+                       words, Counter()) == []
+
+
+def test_a_recurring_wrap_is_still_flagged():
+    """The guard above must not disarm the rule it protects: when the
+    glued form IS an established print ("surface" twice), a leftover
+    fragment is still a suspect."""
+    from qbank.tables import qa_suspects
+    # "su" is printed 9x so the join (6x) is NOT rarer-than-both-parts:
+    # pair rule (a) stays quiet and only the fragment rule can speak.
+    # "rface" is rare (1x) and the join "surface" is an established
+    # print (6x) -> a wrap. With the once-only threshold this test
+    # fails, which is the point: recurring glue keeps flagging.
+    words = Counter({"surface": 6, "su": 9, "rface": 1, "bone": 20})
+    assert qa_suspects([["su rface of the bone"]], words, Counter()) == ["rface"]
+
+
+# --- glued function words (lost spaces in the print itself) -------------
+from qbank.tables import (_repair_token, _repair_tokens,  # noqa: E402
+                          split_glue_words, spacing_fix)
+# The typesetter's narrow table columns drop spaces: ANA p301 prints
+# "Apical partof cellsheds offdur" and MIC p236 "leucocytosis alongwith".
+# The repair is evidence-based and whitespace-only: the glued form must
+# be printed at most ONCE in the book, both halves must be established
+# words (>=2 prints), and the SPACED pair must be a recurring print.
+def test_glued_function_word_in_a_cell_is_respaced():
+    w, p = Counter({"part": 476, "of": 7332, "partof": 1,
+                    "cellsheds": 1, "cells": 527}), Counter()
+    p[("part", "of")] = 369
+    assert _repair_tokens(["Apical", "partof", "cellsheds"], w, p)[0] == \
+        ["Apical", "part of", "cellsheds"]
+
+
+def test_glued_function_word_in_prose_is_respaced():
+    w, p = Counter({"along": 35, "with": 988, "alongwith": 1,
+                    "microscopy": 9}), Counter()
+    p[("along", "with")] = 17
+    assert spacing_fix("leucocytosis alongwith microscopy", None, (w, p)) == \
+        "leucocytosis along with microscopy"
+
+
+def test_latin_anatomical_terms_are_never_split_by_the_glue_rule():
+    """"Depressor labii inferioris" is a real term. With plain _FUNC as
+    the suffix set the cell cascade rewrote it to "inferior is", and it
+    would have corrupted the species names "vaginalis"/"recurrentis"
+    ("inhibitor" -> "inhibit or" too) the moment they reached a cell."""
+    w, p = Counter({"inferior": 386, "is": 3255, "inferioris": 1,
+                    "depressor": 2, "labii": 2, "vaginalis": 3,
+                    "trichomonas": 2, "inhibitor": 9, "inhibit": 4,
+                    "or": 1200}), Counter()
+    p[("inferior", "is")] = 5
+    assert _repair_tokens(["Depressor", "labii", "inferioris"], w, p)[0] == \
+        ["Depressor", "labii", "inferioris"]
+    assert split_glue_words("Depressor labii inferioris", w, p) == \
+        "Depressor labii inferioris"
+    assert _repair_tokens(["Trichomonas", "vaginalis"], w, p)[0] == \
+        ["Trichomonas", "vaginalis"]
+
+
+def test_a_word_the_book_prints_twice_is_never_respaced():
+    """The whole rule turns on "printed at most once": a form the book
+    repeats is a word of the book, not a misprint. (Judged on the rule
+    itself and on the prose pass; the older CELL cascade has its own,
+    separately pinned <=2 prefix rule.)"""
+    w, p = Counter({"the": 900, "same": 300, "thesame": 2}), Counter()
+    p[("the", "same")] = 140
+    assert _repair_token("thesame", w, p)[0] == "thesame"
+    assert split_glue_words("thesame finding", w, p) == "thesame finding"
+
+
+def test_glue_repair_needs_the_spaced_pair_to_recur():
+    w, p = Counter({"part": 476, "of": 7332, "partof": 1}), Counter()
+    p[("part", "of")] = 1                    # printed together only once
+    assert _repair_tokens(["partof"], w, p)[0] == ["partof"]

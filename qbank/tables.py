@@ -153,10 +153,61 @@ _FUNC = frozenset({"the", "not", "of", "a", "an", "in", "on", "at", "is",
                    "into", "from", "than", "may", "no", "so", "if"})
 
 
+# Function words that may drive a LOST-SPACE split inside a token. The
+# four words below are refused because they are also Latin/anatomical
+# ENDINGS: the measurement over both books' vocabularies (every once-
+# printed token split at a glue boundary with both halves established
+# and the spaced pair printed twice or more) listed "arteryin",
+# "layersof", "partof", "thecell", "themiddle", "proximalto",
+# "alongwith", "atleast", "thesame" — all true artifacts — plus exactly
+# ONE false positive, "inferioris" ("Depressor labii inferioris", a real
+# Latin term) from "is". "or"/"as"/"it" are refused for the same class
+# (Latin -or, -as, -it: levator, fetalis/recurrentis species names) and
+# buy no repair in either book.
+_LATIN_TAILS = frozenset({"is", "or", "as", "it"})
+_GLUE_WORDS = frozenset(w for w in _FUNC if w not in _LATIN_TAILS)
+
+
+def _split_glue_token(tok: str, words, pairs):
+    """A function word glued to a common word, printed at most ONCE.
+
+    "partof", "alongwith", "thesame", "layersof", "proximalto" are
+    lost spaces the typesetter left in the print itself: the glued form
+    appears exactly once in the whole book (it IS the artifact), while
+    both halves are established words and the SPACED pair is a
+    recurring print. Nothing else qualifies — a form the book prints
+    twice is a word of the book, not a misprint.
+
+    Returns the re-spaced token, or None. Whitespace is the only thing
+    that ever changes."""
+    lo = tok.lower()
+    if not tok.isalpha() or len(lo) < 6 or words.get(lo, 0) > 1:
+        return None
+    for i in range(2, len(lo) - 1):
+        h, t = lo[:i], lo[i:]
+        if (h in _GLUE_WORDS or t in _GLUE_WORDS) \
+                and words.get(h, 0) >= 2 and words.get(t, 0) >= 2 \
+                and pairs.get((h, t), 0) >= 2:
+            return f"{tok[:i]} {tok[i:]}"
+    return None
+
+
+def split_glue_words(text: str, words, pairs) -> str:
+    """PROSE-side of _split_glue_token: re-space the glued function
+    words a paragraph contains. The prose path never had a token-level
+    repair, so a printed "leucocytosis alongwith microscopy" shipped
+    as-is (MIC-014-020). Whitespace only."""
+    if not text or not words:
+        return text
+    return re.sub(r"[A-Za-z]{6,}",
+                  lambda m: _split_glue_token(m.group(0), words, pairs)
+                  or m.group(0), text)
+
+
 _ORD_TAIL = r"(?:st|nd|rd|th)"
 
 
-def spacing_fix(text: str, mixed=None) -> str:
+def spacing_fix(text: str, mixed=None, vocab=None) -> str:
     """Deterministic spacing fixes for the glue shapes the text layer
     leaves behind (reviewer-directed; purely shape-based, no vocab):
 
@@ -216,6 +267,11 @@ def spacing_fix(text: str, mixed=None) -> str:
     # accidental multiple spaces collapse to one (prose only in
     # practice: table cells arrive here as single-space tokens)
     out = re.sub(r" {2,}", " ", out)
+    # lost-space glue in PROSE ("alongwith" -> "along with"): needs the
+    # book's own word + pair counts, so it only runs when the caller
+    # hands them over
+    if vocab:
+        out = split_glue_words(out, vocab[0], vocab[1])
     # medical-token joins LAST: the repairs above only move spaces
     # around, and this one needs the book's alphanumeric vocabulary
     if mixed:
@@ -239,6 +295,9 @@ def _repair_token(tok: str, words: Counter, pairs: Counter,
     prints (see camel_items). Splitting those undoes the print."""
     if whole and tok.lower() in whole:
         return tok, 0
+    hit = _split_glue_token(tok, words, pairs)
+    if hit:
+        return hit, 1
     m = re.fullmatch(r"([A-Za-z]{3,}),([A-Za-z]{3,})", tok)
     if (m and words.get(m.group(1).lower(), 0) >= 1
             and words.get(m.group(2).lower(), 0) >= 1
@@ -359,7 +418,13 @@ def _repair_tokens(parts: list, words: Counter, pairs: Counter,
                     fixed, nf = f"{core[:len(f)]} {t2}", 1
                     break
             if nf == 0:
-                for f in _FUNC:
+                # SUFFIX splits must use a _GLUE_WORD: with plain _FUNC
+                # this loop rewrote printed terms — "inferioris" ->
+                # "inferior is" (Depressor labii inferioris), and it
+                # would have corrupted "inhibitor" -> "inhibit or",
+                # "vaginalis"/"recurrentis"/"fetalis" (species names)
+                # the moment such a token reached a cell.
+                for f in sorted(_GLUE_WORDS):
                     h = core[:-len(f)]
                     if (core[-len(f):].lower() == f and len(h) >= 5
                             and words.get(h.lower(), 0) >= 5):
@@ -914,10 +979,18 @@ def qa_suspects(matrix: list, words, pairs=None) -> list:
                               toks[k + 1] if k + 1 < len(toks) else None):
                         # a function-word neighbour whose glue is a
                         # misprint blob ("negligible"+"or") is not
-                        # complement evidence
+                        # complement evidence. The glued form must be
+                        # ESTABLISHED (>=2 prints) to read as a wrap: a
+                        # form printed exactly ONCE is the artifact
+                        # itself, not a word — "Sensorylanguage" (p366)
+                        # and "Bilateraljugulodigastric" (p590) each
+                        # print once, so "language"/"jugulodigastric"
+                        # are ordinary words whose separating space the
+                        # typesetter dropped, and flagging them raised
+                        # two REVIEWs that locked the export gate.
                         if p and p.lower() not in _FUNC \
-                                and (w.get((p + t).lower(), 0) >= 1
-                                     or w.get((t + p).lower(), 0) >= 1):
+                                and (w.get((p + t).lower(), 0) >= 2
+                                     or w.get((t + p).lower(), 0) >= 2):
                             qa.append(t)
                             break
     return qa

@@ -21,7 +21,8 @@ from collections import Counter
 from . import glyphs
 from .config import (GRADE_RESOLVED, GRADE_RESOLVED_ANCHORED, PROV_TEXT_LAYER,
                      QA_INCOMPLETE, QA_READY, QA_REVIEW_NEEDED)
-from .tables import ChapterTables, alnum_vocab, spacing_fix
+from .tables import (ChapterTables, alnum_vocab, build_vocab,
+                     spacing_fix)
 from .textlayer import Book, Line, reflow
 from .zones import ChapterScan
 
@@ -171,8 +172,11 @@ def build_chapter_records(book: Book, scan: ChapterScan,
             stem_lines, opts_raw, markers = _split_stem_options(body)
             option_markers[qn] = markers
             mixed = (alnum_vocab(book) if book is not None else None)
+            # word + pair counts for the prose lost-space repair
+            # (memoised on the book, so this is one scan per book)
+            vocab = (build_vocab(book) if book is not None else None)
             stem = spacing_fix(glyphs.repair(reflow(stem_lines), counts),
-                               mixed)
+                               mixed, vocab)
             rec["question_text"] = stem
             for letter in "abcd":
                 raw = opts_raw.get(letter)
@@ -184,10 +188,10 @@ def build_chapter_records(book: Book, scan: ChapterScan,
                 text = " ".join(seed) if seed else ""
                 if rest:
                     tail = spacing_fix(glyphs.repair(reflow(rest), counts),
-                                       mixed)
+                                       mixed, vocab)
                     text = (text + " " + tail).strip() if text else tail
                 rec["options"][letter.upper()] = \
-                    spacing_fix(glyphs.repair(text, counts), mixed) \
+                    spacing_fix(glyphs.repair(text, counts), mixed, vocab) \
                     if text else text
             for ln in body:
                 rec["source_pages"].add(ln.page)
@@ -215,7 +219,7 @@ def build_chapter_records(book: Book, scan: ChapterScan,
             if s_regions:
                 table_regions[(qn, "SOL")] = s_regions
             rec["solution_text"] = spacing_fix(
-                glyphs.repair(reflow(sol_lines), counts), mixed)
+                glyphs.repair(reflow(sol_lines), counts), mixed, vocab)
             for ln in sol_lines:
                 rec["source_pages"].add(ln.page)
             rec["source_pages"].add(rec["s_header_page"])

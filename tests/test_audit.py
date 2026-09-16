@@ -175,3 +175,29 @@ def test_same_stem_different_options_is_not_a_duplicate(tmp_path):
     rep = A.audit_book(root)
     dupes = [f for f in rep["flags"] if f["kind"] == "duplicate_question"]
     assert [f["q_id"] for f in dupes] == ["MIC-001-003"], dupes
+
+
+def test_comma_lists_normalise_the_same_on_both_sides():
+    """ANA-020-004/020-T01: the print reads "(18,19) (B)", the shipped
+    cell "(18, 19) (B)". Whitespace-only difference — but the tokeniser
+    used to see one number on the print's side and two on ours, so the
+    audit flagged a faithful cell as numeric_drift."""
+    from qbank.audit import num_tokens
+    assert num_tokens("Visual association area (18, 19) (B)") == \
+        num_tokens("Visual association area (18,19) (B)")
+    # a different digit is still a drift
+    assert num_tokens("(18, 20) (B)") - num_tokens("(18,19) (B)") == {"1820"}
+    # comma GROUPING is untouched
+    assert num_tokens("1,000 mg") == {"1000"}
+
+
+def test_a_number_wrapped_by_the_print_is_still_evidence():
+    """ANA p366 prints "Visual associationarea (1" / "8,19) (B)" — the
+    number 18,19 is wrapped. The extraction joins the wrap, so the
+    shipped cell must not be called a numeric_drift."""
+    from qbank.audit import page_num_evidence, num_tokens
+    page = "Visual associationarea (1\n8,19) (B)\nPrimary visual cortex(17)"
+    assert "1819" in page_num_evidence(page)
+    assert "1819" not in num_tokens(page)          # raw tokens stay strict
+    # letters between numbers are never bridged ("44 and 45" stays two)
+    assert "4445" not in page_num_evidence("areas 44 and 45 in the cortex")
