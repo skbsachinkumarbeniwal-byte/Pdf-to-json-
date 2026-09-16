@@ -77,6 +77,33 @@ def enabled() -> bool:
         os.environ.get("QBANK_LLM_TABLES", "1") != "0"
 
 
+# --------------------------------------------------------------- models
+# Which model actually served an answer, and which ones this process
+# used at all — provenance the receipt and every accepted table edit can
+# cite. Before this the pipeline knew the model CHAIN it asked, never
+# the model that answered.
+_MODELS_USED: set = set()
+_LAST_MODEL: str | None = None
+
+
+def note_model(model: str | None) -> None:
+    """Record the model that produced a response (called on success)."""
+    global _LAST_MODEL
+    if model:
+        _LAST_MODEL = model
+        _MODELS_USED.add(model)
+
+
+def last_model() -> str | None:
+    """The model that most recently answered, or None."""
+    return _LAST_MODEL
+
+
+def models_used() -> list:
+    """Every model that answered in this process, sorted."""
+    return sorted(_MODELS_USED)
+
+
 def _norm(t: str) -> str:
     return re.sub(r"\s+", "", t or "").lower()
 
@@ -866,6 +893,7 @@ def _call(pool, key: str, model: str, payload: dict):
                           f"run (its own per-key quota still applies)")
                 if os.environ.get("QBANK_LLM_VERBOSE_SHIFT") == "1":
                     print(f"[gemini] {m} served a call (fallback)")
+            note_model(m)          # which model ACTUALLY answered
             return rows
         fails.append((m, kind, detail))
         if kind not in ("exhausted", "no_model", "no_answer"):
@@ -947,10 +975,16 @@ def check_model(model: str | None = None, pool=None,
     return False
 
 
-def _cache_path(cache_dir: Path, book, pg: int, box) -> Path:
-    # T2: prompt now mandates layout-spacing repair + no-deletion
+def _cache_path(cache_dir: Path, book, pg: int, box,
+                model: str | None = None) -> Path:
+    # T3: the TRANSCRIPTION cache is keyed on the model and the prompt
+    # too — the R8/TF2 caches already are, and an answer cached under
+    # another model (or an older prompt) must never be served as this
+    # one's. T2 answers are simply not reused; the pass re-asks once.
     sig = hashlib.sha1(
-        f"T2|{getattr(book.doc, 'name', '')}|{pg}|{tuple(round(v,1) for v in box)}"
+        f"T3|{model or ''}|{_fp8(PROMPT)}|"
+        f"{getattr(book.doc, 'name', '')}|{pg}|"
+        f"{tuple(round(v,1) for v in box)}"
         .encode()).hexdigest()
     return cache_dir / f"{sig}.json"
 
@@ -969,12 +1003,17 @@ def transcriber(cache_dir: Path | None = None, model: str | None = None,
     def llm(book, pg: int, box):
         cache = None
         if cache_dir is not None:
-            cache = _cache_path(cache_dir, book, pg, box)
+            cache = _cache_path(cache_dir, book, pg, box, model)
             if cache.exists():
                 try:
-                    return json.loads(cache.read_text())
-                except Exception:
-                    pass
+                    got = json.loads(cache.read_text())
+                except Exception:                  # noqa: BLE001
+                    got = None
+                if got is not None:
+                    if isinstance(got, dict) and "rows" in got:
+                        note_model(got.get("model"))
+                        return got["rows"]
+                    return got          # a pre-T3 cached answer
         try:
             pix = book.doc[pg - 1].get_pixmap(
                 clip=pymupdf.Rect(*box), matrix=pymupdf.Matrix(3, 3))
@@ -992,8 +1031,11 @@ def transcriber(cache_dir: Path | None = None, model: str | None = None,
                          f"{type(e).__name__}: {e}")
             rows = None
         if cache is not None and rows is not None:
+            # the model that ANSWERED (a chain may have shifted) rides
+            # with the answer, so provenance survives the cache
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(rows))
+            cache.write_text(json.dumps(
+                {"model": last_model(), "rows": rows}))
         return rows
     return llm
 

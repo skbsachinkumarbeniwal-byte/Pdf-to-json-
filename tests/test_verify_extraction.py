@@ -236,3 +236,43 @@ def test_page_line_sets_skips_out_of_range_pages(tiny_pdf):
     lines, texts = ve._page_line_sets(doc, [99, 1], 0)
     assert ve._table_ok("| Madurella mycetomatis |", lines, tuple(texts))
     doc.close()
+
+
+# --- typed verdicts: explained divergences vs real failures -------------
+def test_a_recorded_repair_is_reported_not_failed():
+    """The book prints its own typo ("duoednum"); the run declared the
+    repair ("duodenum") in its ledger, so the cell is EXPLAINED. Without
+    the ledger entry the same cell is a content failure."""
+    md = "| Part | Content |\n|---|---|\n| Duodenum | 2nd part of duodenum |"
+    printed = [["Part", "Content"], ["Duodenum", "2ndpartofduoednumHepatic"]]
+    recorded = [("2nd part of duoednum", "2nd part of duodenum")]
+    assert ve._table_verdict(md, printed, (), recorded) == \
+        [("2nd part of duodenum", "recorded")]
+    assert ve._table_ok(md, printed, (), recorded) is True
+    # same cell, nothing declared -> letters differ from the print
+    assert ve._table_verdict(md, printed, ()) == \
+        [("2nd part of duodenum", "content")]
+    assert ve._table_ok(md, printed, ()) is False
+
+
+def test_a_case_divergence_is_reported_not_failed():
+    md = "| Muscle | Origin |\n|---|---|\n| Psoas | Right psoas major |"
+    printed = [["Muscle", "Origin"], ["Psoas", "RightPsoasmajor"]]
+    assert ve._table_verdict(md, printed, ()) == \
+        [("Right psoas major", "case")]
+    assert ve._table_ok(md, printed, ()) is True
+    # a different WORD is still content
+    other = ("| Muscle | Origin |\n|---|---|\n| Psoas | Right iliacus "
+             "major |")
+    assert ve._table_verdict(other, printed, ()) == \
+        [("Right iliacus major", "content")]
+
+
+def test_a_content_mark_divergence_is_reported_not_failed():
+    md = ("| Nucleus | Function |\n|---|---|\n| Sensory | Give rise to "
+          "sensory nuclei: CN V |")
+    printed = [["Nucleus", "Function"],
+               ["Sensory", "GiverisetosensorynucleiCNV"]]
+    assert ve._table_verdict(md, printed, ()) == \
+        [("Give rise to sensory nuclei: CN V", "mark")]
+    assert ve._table_ok(md, printed, ()) is True

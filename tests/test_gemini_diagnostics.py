@@ -357,3 +357,56 @@ def test_check_model_falls_through_to_a_model_with_quota(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "this run uses fb instead" in out
     assert "model check OK: fb (Fallback)" in out
+
+
+# ---- model provenance --------------------------------------------------
+def test_the_transcription_cache_is_keyed_on_the_model_and_prompt(
+        tmp_path, monkeypatch):
+    """Before this, the page-image transcription cache (T2) was keyed on
+    the page and the box alone: an answer cached under one model could
+    be served as another's, and a prompt change did not invalidate it.
+    The key carries the model and the prompt fingerprint now (the
+    rearrange/refine caches already did), and the stored payload names
+    the model that ANSWERED, so provenance survives a replay."""
+    import json as _json
+
+    import pymupdf
+    import qbank.llm as llm
+    from qbank.textlayer import Book
+
+    doc = pymupdf.open()
+    doc.new_page(width=200, height=200)
+    doc[0].insert_text((20, 60), "table cell text")
+    path = tmp_path / "one.pdf"
+    doc.save(str(path))
+    book = Book(str(path))
+    cache = tmp_path / "cache"
+    box = (10.0, 10.0, 150.0, 120.0)
+
+    key_a = llm._cache_path(cache, book, 1, box, "model-A")
+    key_b = llm._cache_path(cache, book, 1, box, "model-B")
+    assert key_a != key_b                      # per-model identity
+    monkeypatch.setattr(llm, "PROMPT", llm.PROMPT + "\n(rule added)")
+    assert llm._cache_path(cache, book, 1, box, "model-A") != key_a
+    monkeypatch.undo()
+
+    # a cached answer replays WITHOUT any network call, and names the
+    # model that produced it
+    key_a.parent.mkdir(parents=True, exist_ok=True)
+    key_a.write_text(_json.dumps(
+        {"model": "model-A", "rows": [["A"], ["1"]]}))
+    calls = []
+    monkeypatch.setattr(llm, "_post_adaptive",
+                        lambda *a, **k: calls.append(a) or {"candidates": []})
+    rows = llm.transcriber(cache_dir=cache, model="model-A",
+                           key="K")(book, 1, box)
+    assert rows == [["A"], ["1"]] and calls == []
+    assert llm.last_model() == "model-A"
+
+
+def test_the_answered_model_is_recorded_for_provenance():
+    import qbank.llm as llm
+    llm.note_model("gemini-x")
+    assert llm.last_model() == "gemini-x"
+    assert "gemini-x" in llm.models_used()
+

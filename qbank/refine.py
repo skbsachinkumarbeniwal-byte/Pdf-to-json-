@@ -142,7 +142,7 @@ def content_signature(md: str, casefold: bool = False) -> tuple:
     # then failed scripts/verify_extraction.py (it keeps "." and "-").
     # Dash variants are folded first: the book mixes hyphen/en-dash and
     # a model writing "-" for "–" is re-spacing, not changing content.
-    stream = re.sub(r"[^0-9A-Za-z.\-/]", "", _content_text(md))
+    stream = re.sub(r"[^0-9A-Za-z.\-/:]", "", _content_text(md))
     if casefold:
         stream = stream.lower()
     # a MULTISET (sorted) of characters, not a sequence: moving a cell
@@ -410,7 +410,7 @@ def _alnum_sorted(text: str) -> str:
                                  _content_text(text))))
 
 
-_PUNCT_KEEP = "./-"
+_PUNCT_KEEP = "./-:"
 # a mark is judged by the single letter it hangs on: enough to catch a
 # mark that MOVED to another word, and immune to the legitimate
 # re-segmentation the pass performs ("antibodyp-ANCA" -> "antibody
@@ -457,7 +457,77 @@ def _punct_added(before: str, after: str) -> list:
             for _ in range(n)]
 
 
-def same_content(before: str, after: str, words=None) -> tuple:
+# Marks the VERIFIER treats as content: it erases "<br>", tags, ";",
+# ",", bullets — and nothing else. A "." or ":" it can see must be
+# printed, so these four can never be INVENTED by a model stage.
+_CONTENT_MARKS = ".:?!"
+
+
+def _content_mark_keys(text: str) -> Counter:
+    """Multiset of (letter the mark hangs on, mark) for the content
+    marks of a cell. Order-insensitive like _punct_keys: reordering
+    rows/cells must stay free."""
+    out: Counter = Counter()
+    tail = ""
+    for ch in _content_text(text):
+        if ch.isalnum():
+            tail = ch
+        elif ch.isspace():
+            continue
+        elif ch in _CONTENT_MARKS:
+            out[(tail, ch)] += 1
+        else:
+            tail = ""
+    return out
+
+
+def content_mark_increase(before: str, after: str) -> list:
+    """Content marks `after` carries at a letter run where `before` had
+    none — an invention, in the verifier's own terms.
+
+    The run-in fold lets the model DROP a separator the typesetter ran
+    into the text (".Madurella" -> "<br>Madurella") and lets it KEEP
+    one; it never licenses manufacturing one where the print has only a
+    space. Live cases this closes: ANA 017-T02 shipped "Give rise to
+    sensory nuclei: CN V…" over a print that reads "…nucleiCN V…"
+    (017-T03's own listing prints the colon, the sensory one does not),
+    and 052-T04 shipped "…of the epididymis.<br>These tubules…" over a
+    print that separates them with nothing but a space. Both shipped
+    because display_text folds those marks on BOTH sides, so the
+    addition was invisible to the envelope; the independent verifier
+    saw it and failed the cell."""
+    return [f"{ch} after {tail!r}" if tail else ch
+            for (tail, ch), n in (_content_mark_keys(after)
+                                  - _content_mark_keys(before)).items()
+            for _ in range(n)]
+
+
+def _case_backed(before: str, after: str, case) -> bool:
+    """Is a case-only change backed by the book's own print? True when
+    every cased form the model used is a form the book prints, or the
+    book prints no form of that word at all (then the model's casing is
+    all the evidence there is). False lets `same_content` refuse the
+    rearrangement, which keeps the print's case."""
+    if not case:
+        return False
+    words_after = Counter(re.findall(r"[A-Za-z]{2,}", _content_text(after)))
+    words_before = Counter(re.findall(r"[A-Za-z]{2,}", _content_text(before)))
+    for lo in {w.lower() for w in words_after}:
+        forms = case.get(lo)
+        if not forms:
+            continue
+        a_forms = {w for w in words_after if w.lower() == lo}
+        b_forms = {w for w in words_before if w.lower() == lo}
+        if a_forms == b_forms:
+            continue
+        # every shape the model used must be one the book prints
+        if not a_forms <= set(forms):
+            return False
+    return True
+
+
+def same_content(before: str, after: str, words=None,
+                 case=None) -> tuple:
     """(True, diff) when the model only moved/re-spaced the table;
     (False, diff) when a letter or digit changed — or when `words` (the
     book vocabulary) shows the answer split/joined a word the printed
@@ -484,10 +554,29 @@ def same_content(before: str, after: str, words=None) -> tuple:
     same_sig = (sb, nb) == (sa, na)
     diff = None if same_sig else signature_diff(before, after)
     added = _punct_added(before, after)
+    invented = content_mark_increase(before, after)
     letters_ok = (nb == na
                   and _alnum_sorted(before) == _alnum_sorted(after))
     if diff is not None and diff["case_only"] and not added:
-        return True, diff                    # capitalisation only
+        if _case_backed(before, after, case):
+            return True, diff                # capitalisation the book prints
+        # the book prints the other case: keeping the extraction's
+        # casing is the faithful answer (ANA 049-T02 "Right Psoas major"
+        # was rearranged to "psoas", which no page of the book prints)
+        diff = dict(diff)
+        diff["case_unsupported"] = True
+        diff["summary"] = (f"{diff.get('summary') or ''}"
+                           f"{'; ' if diff.get('summary') else ''}"
+                           f"case change not printed by the book")
+        return False, diff
+    if invented:
+        diff = diff if diff is not None else signature_diff(before, after)
+        diff["summary"] = (f"{diff.get('summary') or ''}"
+                           f"{'; ' if diff.get('summary') else ''}"
+                           f"mark invented="
+                           f"{', '.join(invented[:4])}")
+        diff["marks_invented"] = invented
+        return False, diff
     if added or not letters_ok:
         diff = diff if diff is not None else signature_diff(before, after)
         if added:
@@ -507,6 +596,18 @@ def same_content(before: str, after: str, words=None) -> tuple:
                            f"segmentation={how}")
         return False, diff
     return True, {}
+
+
+def model_stamp() -> dict:
+    """{"model": "<id>"} for the model that last answered — provenance
+    for a shipped table. {} when no model call has happened (tests, a
+    cache replay, or an LLM-disabled run)."""
+    try:
+        from .llm import last_model
+        m = last_model()
+        return {"model": m} if m else {}
+    except Exception:                            # noqa: BLE001
+        return {}
 
 
 def flagged(t: dict) -> bool:
@@ -720,11 +821,26 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
         print(f"[gemini] {(t.get('table_id') or '?')}: {nseg} word "
               f"boundary repair(s) in the rearrangement (book-vocabulary "
               f"evidence)", flush=True)
+    # CASE: a casing the book never prints is a model invention, not a
+    # style choice — restore the printed form before judging the change
+    if book is not None:
+        from .tables import case_profile, restore_printed_case
+        new, ncase = restore_printed_case(new, case_profile(book))
+        if ncase:
+            val0 = t.setdefault("validation", {})
+            val0["case_repairs"] = ncase
+            print(f"[gemini] {(t.get('table_id') or '?')}: {ncase} casing "
+                  f"repair(s) in the rearrangement (book-print evidence)",
+                  flush=True)
     # CONTENT ENVELOPE: reordering and re-spacing are the model's job,
     # changing a letter or a number is not. Until this check existed a
     # hallucinated cell shipped as the table (see the module docstring:
     # the extraction is the only authority for characters).
-    ok_content, diff = same_content(md, new, vocab)
+    case = None
+    if book is not None:
+        from .tables import case_profile
+        case = case_profile(book)
+    ok_content, diff = same_content(md, new, vocab, case)
     if not ok_content:
         _note_content_reject(t, diff)
         val = t.setdefault("validation", {})
@@ -734,6 +850,7 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
                       "(only rearrangement/spacing is allowed)",
             "diff": {k: v for k, v in diff.items() if k != "case_only"},
             "kept": "deterministic_extraction",
+            **model_stamp(),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
         return "content_changed"
     val = t.setdefault("validation", {})
@@ -744,6 +861,14 @@ def refine_table(t: dict, book, refine_fn, only: str = "all",
         val["gemini_rearrange"] = {
             "status": "ACCEPTED_CASE_ONLY",
             "note": "capitalisation changed; letters/digits identical",
+            **model_stamp(),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    elif t.get("markdown") != md:
+        # provenance for an accepted rearrangement: which model answered
+        val["gemini_rearrange"] = {
+            "status": "ACCEPTED_REARRANGED",
+            "diff": {},
+            **model_stamp(),
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if salvaged:
         qa["salvaged_from_wrapper"] = True   # provenance: it came chatty

@@ -867,3 +867,34 @@ def test_a_period_the_marks_rule_sees_when_it_moves():
     rec = F._cell_change("Staph. aureus", "Staph aureus .", None, None, None)
     assert rec is not None
     assert rec.get("fatal") or rec["kind"] == "reorder"
+
+
+# --- a <br> where the print has a run-in separator is not a cut word ----
+def test_a_runin_separator_turned_into_a_line_break_is_not_mid_word():
+    """The print runs list items together with a period
+    ("…apiospermum).Madurella…"); the model bulleting them is
+    restructuring, not a cut word. The counter demanded two LETTERS
+    around the break and called the dot case mid_word_break, which threw
+    a faithful rearrangement away (ch24 of the real book: 6 of them)."""
+    from qbank.refine_final import _new_mid_word_breaks
+    b = "Scedosporium apiospermum).Madurella mycetomatis"
+    a = "Scedosporium apiospermum).<br>Madurella mycetomatis"
+    assert _new_mid_word_breaks(b, a) == 0
+    assert _new_mid_word_breaks("receptor", "recep<br>tor") == 1
+    assert _new_mid_word_breaks("dome shaped", "dome<br>shaped") == 0
+
+
+def test_an_invented_content_mark_is_fatal_in_the_final_stage():
+    """052-T04 shipped "…of the epididymis.<br>These tubules…" while the
+    print separates the sentences with nothing but a space."""
+    from qbank.refine_final import _cell_change
+    c = _cell_change(
+        "Efferent ducts from the head open into the tubules of the "
+        "epididymis These tubules coalesce",
+        "Efferent ducts from the head open into the tubules of the "
+        "epididymis.<br>These tubules coalesce", set(), None, None)
+    assert c and c["kind"] == "mark_added" and c["fatal"] == "mark_added"
+    # the printed run-in dot stays fine
+    ok = _cell_change("apiospermum).Madurella", "apiospermum).<br>Madurella",
+                      set(), None, None)
+    assert ok and ok["kind"] == "presentation"

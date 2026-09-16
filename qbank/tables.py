@@ -75,6 +75,7 @@ def build_vocab(book) -> tuple:
     # so before this Counter existed a printed `CD4` left no evidence
     # anywhere and the medical-token repair had nothing to stand on.
     mixed: Counter = Counter()
+    case: dict = {}                            # lowercase -> printed forms
     items: Counter = Counter()                 # camel-boundary sub-runs
     for pg in range(1, book.total_pages + 1):
         for wr in word_rows(book.page(pg)):
@@ -84,7 +85,25 @@ def build_vocab(book) -> tuple:
                     if (m := _ALPHA.fullmatch(
                         w.text.strip(".,;:!?()[]{}\"'"))) is not None]
             for t in toks:
-                words[t.lower()] += 1
+                lo = t.lower()
+                words[lo] += 1
+                if len(t) >= 2:
+                    case.setdefault(lo, Counter())[t] += 1
+            # CASE PROVENANCE: which exact forms the book prints for a
+            # word ("psoas" -> {"Psoas": 3}). Counted for EVERY printed
+            # token's alphabetic runs too, not just the pure-alpha ones:
+            # the page prints "Eg:Apocrine sweat glands" as ONE glued
+            # token, so counting only pure-alpha tokens left "Eg" with no
+            # evidence at all — and a casing with no evidence is exactly
+            # what the repair rewrites, which turned a faithful "Eg" into
+            # "eg" on p301 (016-T01). Case is content: the verifier
+            # compares letter identity.
+            for w in wr:
+                if _ALPHA.fullmatch(w.text.strip(".,;:!?()[]{}\"'")):
+                    continue        # pure-alpha tokens were counted above
+                for run in _ALPHA.findall(w.text):
+                    if len(run) >= 2:
+                        case.setdefault(run.lower(), Counter())[run] += 1
             for a, b in zip(toks, toks[1:]):
                 pairs[(a.lower(), b.lower())] += 1
             for w in wr:
@@ -110,6 +129,10 @@ def build_vocab(book) -> tuple:
         book._qbank_items = items
     except Exception:                           # noqa: BLE001
         pass                                    # read-only book: recompute
+    try:                        # the case table rides along with the
+        book._qbank_case = case  # vocabulary it was counted with
+    except Exception:                            # noqa: BLE001
+        pass
     return words, pairs
 
 
@@ -674,10 +697,71 @@ class BoxTable:
     vocab_fixes: int = 0
     punct_fixes: int = 0          # space around , ; : ( ) quotes repaired
     med_token_fixes: int = 0      # split medical tokens rejoined (C D4->CD4)
+    case_fixes: int = 0           # casing restored to the print's own form
     llm_fixes: int = 0
     verify_calls: int = 0
     verify_clear: bool = False
     warnings: list = field(default_factory=list)
+
+
+def case_profile(book) -> dict:
+    """lowercase form -> Counter of the exact PRINTED forms of that word
+    ("psoas" -> {"Psoas": 3}); {} when the vocabulary cannot be built.
+
+    Shares build_vocab's single page scan (memoised on the book), so
+    asking for it is free after the extraction built the vocabulary."""
+    cached = getattr(book, "_qbank_case", None)
+    if cached is None:
+        try:
+            build_vocab(book)
+        except Exception:                        # noqa: BLE001
+            return {}
+        cached = getattr(book, "_qbank_case", None)
+    return cached or {}
+
+
+# How often the book must print the form we are about to impose.
+MIN_CASE_EVIDENCE = 2
+
+
+def restore_printed_case(text: str, case, min_evidence: int = None) -> tuple:
+    """(text, n) — casing the book never prints is restored to the
+    book's most-printed form of that word.
+
+    A model stage may hand back a casing no page of the book uses
+    ("Right Psoas major" came back as "Right psoas major"; the ANA
+    verifier then failed the cell, because case is content there). The
+    rule is evidence-only and token-local:
+
+      * a token whose exact form IS printed somewhere in the book is
+        left untouched — "The"/"the" both occur, so sentence case at a
+        cell start survives;
+      * a token the book never prints in that casing is rewritten to
+        the most-printed form of the same word;
+      * a word with no printed form at all is left alone.
+
+    Only letters change; spacing, order and every other character are
+    untouched."""
+    if not text or not case:
+        return text, 0
+    n = 0
+
+    def fix(m):
+        nonlocal n
+        tok = m.group(0)
+        forms = case.get(tok.lower())
+        if not forms or tok in forms:
+            return tok
+        best, count = max(forms.items(), key=lambda kv: (kv[1], kv[0]))
+        if count < (MIN_CASE_EVIDENCE if min_evidence is None
+                    else min_evidence):
+            # thin evidence (a single stray print) is not enough to
+            # overrule a token: leave it to the verifier's WARN
+            return tok
+        n += 1
+        return best
+
+    return re.sub(r"[A-Za-z]{2,}", fix, text), n
 
 
 def alnum_vocab(book):
@@ -1138,6 +1222,7 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
             matrix.append(row)
     bt.rows = matrix
     bt.header = tuple(matrix[0]) if matrix else ()
+    det_matrix = [list(r) for r in matrix]    # the print's own text
     if llm is not None and matrix:
         lm = llm(book, pg, box)
         if lm:
@@ -1163,6 +1248,27 @@ def build_box(book, pg: int, box, counts, vocab=None, llm=None,
                     bt.llm_fixes += n2
                     bt.rows = matrix
                     bt.header = tuple(matrix[0])
+    if matrix:
+        # CASE: a casing no page of the book prints is a model
+        # invention, not a style choice. Evidence-only and per token
+        # (see restore_printed_case) — a form the book prints anywhere
+        # is never touched, so this cannot overrule the print, and the
+        # dominant form must itself be printed at least
+        # MIN_CASE_EVIDENCE times for the rewrite to happen at all.
+        #
+        # NOT judged box-by-box: a box's evidence is line-broken, and
+        # the print splits words across lines ("…(dorsal horns).T" +
+        # "he rhombic lip…"), so a per-box profile misses "The"
+        # entirely and would have "corrected" a faithful capital into
+        # "the". The book-wide vocabulary is the only complete evidence.
+        case = case_profile(book)
+        if case:
+            for row in matrix:
+                for i, cell in enumerate(row):
+                    fixed, n = restore_printed_case(cell, case)
+                    if n:
+                        row[i] = fixed
+                        bt.case_fixes += n
     return bt
 
 
@@ -1181,6 +1287,7 @@ class LogicalTable:
     llm_fixes: int
     cross_page: bool
     warnings: list
+    case_fixes: int = 0                # casing restored to the print's form
     qa_tokens: list = field(default_factory=list)
 
     @property
@@ -1204,6 +1311,8 @@ class LogicalTable:
                 "vocab_space_fixes": self.vocab_fixes,
                 "punct_space_fixes": self.punct_fixes,
                 "llm_space_repairs": self.llm_fixes,
+                **({"case_repairs": self.case_fixes}
+                   if getattr(self, "case_fixes", 0) else {}),
                 "table_qa": {
                     "status": "REVIEW" if self.qa_tokens else "ok",
                     "suspect_fragments": self.qa_tokens[:12],
@@ -1356,6 +1465,7 @@ class ChapterTables:
             camel_fixes=camels, vocab_fixes=vfix, punct_fixes=pfx,
             llm_fixes=lfix,
             cross_page=len(chunks) > 1, warnings=warns,
+            case_fixes=sum(b.case_fixes for b in bts),
             qa_tokens=sorted(set(qa))[:12])
         self._lt_cache[ci] = lt
         return lt

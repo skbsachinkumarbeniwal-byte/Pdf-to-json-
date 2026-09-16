@@ -3,6 +3,7 @@ validation only (stubbed model — no network). Also covers the export
 gate contract: review queue clear -> zip builds, census advisories
 never block."""
 import json
+from collections import Counter
 
 import pytest
 
@@ -674,7 +675,62 @@ def test_a_respaced_dash_stays_legal():
     assert refine_mod.same_content(before, after)[0] is True
 
 
-def test_a_case_only_change_is_still_reported_not_refused():
+def test_a_case_only_change_needs_the_books_own_print():
+    """Case is content: the verifier compares letter identity, so a
+    casing no page of the book prints is an invention (ANA 049-T02
+    shipped "Right psoas major" over a print that reads "Right Psoas
+    major" and failed the independent check). The rearrangement is
+    accepted only when the book itself prints the model's form."""
     shouted = _CELL_TABLE.replace("Madurella", "MADURELLA")
+    # no evidence at hand -> the print's casing is authoritative
     ok, diff = refine_mod.same_content(_CELL_TABLE, shouted)
+    assert ok is False and diff["case_unsupported"] is True
+    # the book prints this form -> the model's casing is fine
+    case = {"madurella": Counter({"MADURELLA": 2})}
+    ok, diff = refine_mod.same_content(_CELL_TABLE, shouted, case=case)
     assert ok is True and diff["case_only"] is True
+
+
+def test_a_casing_the_book_never_prints_is_restored_not_shipped():
+    from qbank.tables import restore_printed_case
+    case = {"psoas": Counter({"Psoas": 3, "PSOAS": 1}),
+            "the": Counter({"the": 900, "The": 40}),
+            "right": Counter({"Right": 40, "right": 5}),
+            "major": Counter({"major": 12})}
+    # "psoas" is a casing the book never prints -> dominant form restored
+    out, n = restore_printed_case("Right psoas major", case)
+    assert (out, n) == ("Right Psoas major", 1)
+    # casings the book DOES print are untouched, however rare ("The" 40x
+    # against "the" 900x stays as the print has it) — and a word with no
+    # printed form at all is left alone
+    out, n = restore_printed_case("The Right psoas major zzz", case)
+    assert out == "The Right Psoas major zzz" and n == 1
+    # the minority printed casing is still a printed casing
+    out, n = restore_printed_case("PSOAS", case)
+    assert (out, n) == ("PSOAS", 0)
+
+
+# --- content marks may never be INVENTED (verifier-visible marks) -------
+def test_an_invented_colon_is_refused():
+    """ANA 017-T02 shipped "Give rise to sensory nuclei: CN V, VII…"
+    where the print reads "…nucleiCN V…" (the motor listing of the same
+    page does print its colon). display_text does not fold ":", so this
+    is the class the signature must see — and the verifier keeps ":"."""
+    before = "| A | Give rise to sensory nuclei CN V, VII, VIII |\n|---|---|\n"
+    after = "| A | Give rise to sensory nuclei: CN V, VII, VIII |\n|---|---|\n"
+    ok, diff = refine_mod.same_content(before, after)
+    assert ok is False and "mark invented" in diff["summary"]
+    assert diff["marks_invented"] == [": after 'i'"]
+
+
+def test_an_invented_period_is_refused_but_a_printed_one_is_not():
+    before = "| A | of the epididymis These tubules coalesce |\n|---|---|\n"
+    after = "| A | of the epididymis.<br>These tubules coalesce |\n|---|---|\n"
+    assert refine_mod.same_content(before, after)[0] is False
+    # the print's own run-in separator: keeping it, or normalising it to
+    # a bullet, is presentation — both must stay legal
+    run_in = "| A | apiospermum).Madurella mycetomatis |\n|---|---|\n"
+    bullets = "| A | apiospermum).<br>Madurella mycetomatis |\n|---|---|\n"
+    assert refine_mod.same_content(run_in, bullets)[0] is True
+    same = "| A | apiospermum). Madurella mycetomatis |\n|---|---|\n"
+    assert refine_mod.same_content(run_in, same)[0] is True

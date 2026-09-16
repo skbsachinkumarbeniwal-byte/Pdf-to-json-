@@ -245,3 +245,44 @@ def test_spacing_fix_ordinals_notations_brackets():
                  "Causes:", "5,000", "1.3:1", "J.K.Rowling",
                  "v1.2Beta", "0,5", "e.g.", "B/L"):
         assert spacing_fix(keep) == keep
+
+
+# --- case is content: the print is the authority ------------------------
+def test_case_profile_counts_the_printed_forms(tmp_path):
+    from qbank.tables import build_vocab, case_profile
+    book = _book_with(tmp_path, [[["Psoas", "muscle"], ["psoas", "Muscle"]]])
+    build_vocab(book)
+    prof = case_profile(book)
+    assert prof["psoas"] == {"Psoas": 1, "psoas": 1}
+    assert prof["muscle"] == {"muscle": 1, "Muscle": 1}
+
+
+def test_restore_printed_case_needs_the_book_never_printing_the_form():
+    from collections import Counter
+    from qbank.tables import restore_printed_case
+    case = {"psoas": Counter({"Psoas": 2})}
+    assert restore_printed_case("Right psoas major", case) == \
+        ("Right Psoas major", 1)
+    assert restore_printed_case("Right Psoas major", case) == \
+        ("Right Psoas major", 0)
+    # a word the profile does not know is never touched
+    assert restore_printed_case("xyzzy psoas", case) == ("xyzzy Psoas", 1)
+    # no profile at all -> identity
+    assert restore_printed_case("psoas", {}) == ("psoas", 0)
+
+
+def test_a_casing_the_book_prints_once_is_left_alone():
+    """The evidence floor: a form printed once (MIN_CASE_EVIDENCE = 2)
+    is not enough to overrule a token — the verifier reports such a
+    divergence as a WARN instead of the pipeline silently rewriting
+    it. This is also why the pass is not judged box-by-box: a box's
+    own evidence is line-broken ("…horns).T" + "he rhombic lip") and
+    would miss "The" entirely."""
+    from collections import Counter
+    from qbank.tables import MIN_CASE_EVIDENCE, restore_printed_case
+    thin = {"the": Counter({"the": 1})}
+    assert restore_printed_case("The rhombic lip", thin) == \
+        ("The rhombic lip", 0)
+    strong = {"the": Counter({"the": MIN_CASE_EVIDENCE})}
+    assert restore_printed_case("The rhombic lip", strong) == \
+        ("the rhombic lip", 1)

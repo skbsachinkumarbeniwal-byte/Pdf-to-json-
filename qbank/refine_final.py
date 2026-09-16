@@ -58,6 +58,7 @@ from pathlib import Path
 from .audit import load_page_text, num_tokens, page_num_evidence
 from .refine import (flagged as qa_flagged, restore_split_words,
                      salvage_table, segmentation_weakens)
+from .refine import content_mark_increase
 from .tables import qa_suspects
 
 LEDGER = "table_refinement.jsonl"
@@ -129,7 +130,13 @@ def _new_mid_word_breaks(b: str, a: str) -> int:
                 # gap == "" means the two letters were ADJACENT in the
                 # source (a real mid-word break); any gap is whitespace
                 gap = b[pb[n_before - 1] + 1:pb[n_before]]
-                if gap == "":
+                # a break is MID-WORD only between two word characters:
+                # the print's run-in separator ("…apiospermum).Madurella
+                # …") is presentation, so the model turning it into a
+                # <br> is restructuring, not a cut word. Genuine cuts
+                # ("recep"+"tor") have letters on both sides.
+                if (gap == "" and b[pb[n_before - 1]].isalnum()
+                        and b[pb[n_before]].isalnum()):
                     count += 1
             i += m.end()
             continue
@@ -381,7 +388,7 @@ def _mark_keys(text: str) -> Counter:
             tail = ch
         elif ch.isspace():
             continue
-        elif ch in "./-":
+        elif ch in "./-:":
             out[(tail, ch)] += 1
         else:
             tail = ""
@@ -427,6 +434,18 @@ def _cell_change(bc: str, ac: str, words, page_nums, mch: dict | None) -> dict |
             # and the human queue would have had nothing to decide).
             return {**base, "kind": "mid_word_break",
                     "fatal": "mid_word_break"}
+        invented = content_mark_increase(b, a)
+        if invented:
+            # same characters, but a "." or ":" appeared where the
+            # print has none. display_text folds the run-in separator
+            # on BOTH sides, which is what made this invisible: the
+            # fold may drop a printed separator or normalise one that
+            # IS printed, never manufacture one over a plain space
+            # (live: 052-T04 shipped "of the epididymis.<br>These
+            # tubules" while the print separates the sentences with
+            # nothing but a space).
+            return {**base, "kind": "mark_added", "fatal": "mark_added",
+                    "detail": {"marks": invented[:6]}}
         tb, ta = display_text(b).split(), display_text(a).split()
         if tb == ta:
             kind = "presentation"
@@ -806,12 +825,23 @@ def final_refine_table(t: dict, book, fn, only: str = "all",
                         status = "accepted"
     # ---- apply / flag / log ----------------------------------------
     if status == "accepted":
+        # CASE: the model may return a casing no page of the book
+        # prints ("Psoas" -> "psoas"); restore the printed form
+        # before shipping (evidence-only, token-local).
+        if book is not None:
+            from .tables import case_profile, restore_printed_case
+            fixed_md, ncase = restore_printed_case(new_md,
+                                                   case_profile(book))
+            if ncase:
+                new_md = fixed_md
+                val["case_repairs"] = ncase
         val["pre_final_markdown"] = md
         val["final_refine"] = {
             "action": "REFINED",
             "gemini": True,
             "cells_checked": cells_checked,
             "changes": cells_changed,
+            **model_stamp(),
         }
         qa["refined_final_by_gemini"] = True
         t["markdown"] = new_md
@@ -859,6 +889,28 @@ def final_refine_table(t: dict, book, fn, only: str = "all",
 
 
 # --------------------------------------------------------- audit
+
+def _models_used() -> list:
+    """Models that ANSWERED during this run (empty on a cache
+    replay)."""
+    try:
+        from .llm import models_used
+        return models_used()
+    except Exception:                            # noqa: BLE001
+        return []
+
+
+def model_stamp() -> dict:
+    """{"model": "<id>"} for the model that last answered — the
+    provenance a shipped table edit can cite. {} when no model call
+    happened (tests, cache replay, LLM disabled)."""
+    try:
+        from .llm import last_model
+        m = last_model()
+        return {"model": m} if m else {}
+    except Exception:                            # noqa: BLE001
+        return {}
+
 
 def _iter_ledger(path: Path, subject: str) -> dict:
     """key -> latest row (a re-run rewrites a table's state)."""
@@ -986,6 +1038,7 @@ def write_audit(output_root, subject: str, api_calls: int | None = None,
         "rejected_deletions": rejected_deletions,
         "rejected_number_changes": rejected_number_changes,
         "render_page_waste_issues": render_issues,
+        "models_used": _models_used(),
         "gemini_api_calls": api_calls if api_calls is not None else None,
         "before_after_regression": {
             "ok": reg_ok, "chapters": len(reg_rows),
